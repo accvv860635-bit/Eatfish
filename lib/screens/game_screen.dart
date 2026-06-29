@@ -1510,9 +1510,8 @@ class _GameScreenState extends State<GameScreen>
                                   _playerSizeMultiplier >
                                   _initialPlayerSize * .15,
                               sizePercent: _playerSizeMultiplier,
-                              onPressed: _isBoosting
-                                  ? _stopBoosting
-                                  : _startBoosting,
+                              onStart: _startBoosting,
+                              onStop: _stopBoosting,
                             ),
                             const SizedBox(width: 8),
                             Flexible(
@@ -1837,21 +1836,25 @@ class _BoostButton extends StatelessWidget {
     required this.isBoosting,
     required this.canBoost,
     required this.sizePercent,
-    required this.onPressed,
+    required this.onStart,
+    required this.onStop,
   });
 
   final bool isBoosting;
   final bool canBoost;
   final double sizePercent;
-  final VoidCallback onPressed;
+  final VoidCallback onStart;
+  final VoidCallback onStop;
 
   @override
   Widget build(BuildContext context) {
     final active = isBoosting && canBoost;
-    return GestureDetector(
-      onTapDown: (_) => onPressed(),
-      onTapUp: (_) {
-        if (isBoosting) onPressed();
+    return Listener(
+      onPointerDown: (_) {
+        if (!isBoosting) onStart();
+      },
+      onPointerUp: (_) {
+        if (isBoosting) onStop();
       },
       child: Container(
         width: 52,
@@ -1923,8 +1926,10 @@ class _SkillButton extends StatelessWidget {
     final progress = ready
         ? 1.0
         : 1.0 - (cooldown / skill.cooldown).clamp(0.0, 1.0);
-    return GestureDetector(
-      onTap: ready ? onTap : null,
+    return Listener(
+      onPointerDown: (_) {
+        if (ready) onTap();
+      },
       child: SizedBox(
         width: 52,
         height: 52,
