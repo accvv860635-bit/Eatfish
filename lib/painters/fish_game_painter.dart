@@ -5,6 +5,8 @@ import 'package:flutter/material.dart';
 
 import '../models/fish_entity.dart';
 import '../models/fish_spec.dart';
+import '../models/obstacle.dart';
+import '../models/power_up.dart';
 import '../models/seaweed_patch.dart';
 
 class FishGamePainter extends CustomPainter {
@@ -14,7 +16,6 @@ class FishGamePainter extends CustomPainter {
     required this.player,
     required this.playerLevel,
     required this.playerHeading,
-    required this.hurt,
     required this.playerHidden,
     required this.playerBite,
     required this.seaweed,
@@ -23,6 +24,15 @@ class FishGamePainter extends CustomPainter {
     required this.zoom,
     required this.world,
     required this.screen,
+    this.powerUps = const [],
+    this.obstacles = const [],
+    this.activeEffects = const [],
+    this.isBoosting = false,
+    this.poisonTrail = const [],
+    this.playerSizeMultiplier = 1.0,
+    this.sonicWaveRadius = 0,
+    this.isInvincible = false,
+    this.skillL3Active = false,
   });
 
   final ui.Image fishImage;
@@ -30,7 +40,6 @@ class FishGamePainter extends CustomPainter {
   final Offset player;
   final int playerLevel;
   final Offset playerHeading;
-  final bool hurt;
   final bool playerHidden;
   final double playerBite;
   final List<SeaweedPatch> seaweed;
@@ -39,19 +48,48 @@ class FishGamePainter extends CustomPainter {
   final double zoom;
   final Size world;
   final Size screen;
+  final List<PowerUp> powerUps;
+  final List<Obstacle> obstacles;
+  final List<ActiveEffect> activeEffects;
+  final bool isBoosting;
+  final List<Offset> poisonTrail;
+  final double playerSizeMultiplier;
+  final double sonicWaveRadius;
+  final bool isInvincible;
+  final bool skillL3Active;
 
   @override
   void paint(Canvas canvas, Size size) {
-    // 攝影機平移 → 世界座標轉螢幕座標
     canvas.save();
     canvas.scale(zoom);
     canvas.translate(-camera.dx, -camera.dy);
 
     _drawSeaweed(canvas, front: false);
 
+    // Draw obstacles (behind fish)
+    for (final obs in obstacles) {
+      if (!_isInView(obs.position)) continue;
+      _drawObstacle(canvas, obs);
+    }
+
+    // Draw poison trail
+    if (poisonTrail.isNotEmpty) {
+      _drawPoisonTrail(canvas);
+    }
+
+    // Draw power-ups
+    for (final pu in powerUps) {
+      if (!_isInView(pu.position)) continue;
+      _drawPowerUp(canvas, pu);
+    }
+
+    // Draw sonic wave
+    if (sonicWaveRadius > 0) {
+      _drawSonicWave(canvas);
+    }
+
     final ordered = [...fish]..sort((a, b) => a.depth.compareTo(b.depth));
     for (final entity in ordered) {
-      // 只繪製在可見範圍內的魚（含緩衝）
       if (!_isInView(entity.position)) continue;
 
       final scale = ui.lerpDouble(.94, 1.04, entity.depth)!;
@@ -75,28 +113,82 @@ class FishGamePainter extends CustomPainter {
       );
     }
 
-    if (hurt) {
+    // Player shield glow
+    if (activeEffects.any((e) => e.type == PowerUpType.shield)) {
       canvas.drawCircle(
         player,
-        fishLength(playerLevel) * .48,
+        fishLength(playerLevel) * .7,
         Paint()
-          ..color = const Color(0xffff355d).withValues(alpha: .26)
+          ..color = const Color(0xff2196f3).withValues(alpha: .2)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 4,
+      );
+    }
+
+    // Player star glow
+    if (activeEffects.any((e) => e.type == PowerUpType.star)) {
+      canvas.drawCircle(
+        player,
+        fishLength(playerLevel) * .7,
+        Paint()
+          ..color = const Color(0xffffd700).withValues(alpha: .3)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 4,
+      );
+    }
+
+    // Player invincible glow
+    if (isInvincible) {
+      canvas.drawCircle(
+        player,
+        fishLength(playerLevel) * .65,
+        Paint()
+          ..color = const Color(0xffffff00).withValues(alpha: .25)
           ..style = PaintingStyle.stroke
           ..strokeWidth = 3,
       );
     }
+
+    // Boost trail
+    if (isBoosting) {
+      final trailPaint = Paint()
+        ..color = const Color(0xff00e5ff).withValues(alpha: .35);
+      final trailStart = player - playerHeading * fishLength(playerLevel) * .5;
+      canvas.drawCircle(trailStart, fishLength(playerLevel) * .18, trailPaint);
+      canvas.drawCircle(
+        trailStart - playerHeading * fishLength(playerLevel) * .25,
+        fishLength(playerLevel) * .12,
+        trailPaint..color = const Color(0xff00e5ff).withValues(alpha: .18),
+      );
+    }
+
     _drawFish(
       canvas,
       player,
       playerHeading,
-      fishLength(playerLevel) * 1.16,
-      playerHidden ? 0 : 1,
+      fishLength(playerLevel) * 1.16 * playerSizeMultiplier,
+      playerHidden ? .25 : 1,
       const Color(0xffffffff),
       playerLevel,
       false,
       isPlayer: true,
       bite: playerBite,
+      isInvincible: isInvincible,
+      isShielded: activeEffects.any((e) => e.type == PowerUpType.shield),
+      isStar: activeEffects.any((e) => e.type == PowerUpType.star),
     );
+
+    // Skill L3 inflate ring
+    if (skillL3Active) {
+      canvas.drawCircle(
+        player,
+        fishLength(playerLevel) * 1.8,
+        Paint()
+          ..color = const Color(0xffff9800).withValues(alpha: .3)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 3,
+      );
+    }
 
     _drawSeaweed(canvas, front: true);
 
@@ -104,7 +196,7 @@ class FishGamePainter extends CustomPainter {
   }
 
   bool _isInView(Offset worldPos) {
-    const buffer = 160.0;
+    const buffer = 200.0;
     final visibleWidth = screen.width / zoom;
     final visibleHeight = screen.height / zoom;
     return worldPos.dx > camera.dx - buffer &&
@@ -125,6 +217,9 @@ class FishGamePainter extends CustomPainter {
     bool isPlayer = false,
     double bite = 0,
     FishBehaviorState behaviorState = FishBehaviorState.wander,
+    bool isInvincible = false,
+    bool isShielded = false,
+    bool isStar = false,
   }) {
     final angle = atan2(direction.dy, direction.dx);
     final height = length * .44;
@@ -150,6 +245,18 @@ class FishGamePainter extends CustomPainter {
       isPlayer ? 8 : 4,
       false,
     );
+
+    // Star/invincible player tint
+    if (isPlayer && isStar) {
+      final starPaint = Paint()
+        ..color = const Color(0xffffd700).withValues(alpha: .35);
+      canvas.drawRect(rect, starPaint);
+    } else if (isPlayer && isShielded) {
+      final shieldPaint = Paint()
+        ..color = const Color(0xff448aff).withValues(alpha: .25);
+      canvas.drawRect(rect, shieldPaint);
+    }
+
     if (level >= 15) {
       _drawMonsterFish(canvas, rect, level, opacity, bite);
     } else {
@@ -453,6 +560,340 @@ class FishGamePainter extends CustomPainter {
       ..color = const Color(0xffff4058).withValues(alpha: opacity * .85);
     canvas.drawCircle(center, height * 1.15, paint);
   }
+
+  // ─── Power-up rendering ───
+
+  void _drawPowerUp(Canvas canvas, PowerUp pu) {
+    final pulse = sin(pu.timer * 3) * .25 + .75;
+    Color glowColor;
+    switch (pu.type) {
+      case PowerUpType.boost:
+        glowColor = const Color(0xff00bcd4);
+        break;
+      case PowerUpType.magnet:
+        glowColor = const Color(0xff9c27b0);
+        break;
+      case PowerUpType.shield:
+        glowColor = const Color(0xff2196f3);
+        break;
+      case PowerUpType.poison:
+        glowColor = const Color(0xff4caf50);
+        break;
+      case PowerUpType.doubleScore:
+        glowColor = const Color(0xffffc107);
+        break;
+      case PowerUpType.vortex:
+        glowColor = const Color(0xff607d8b);
+        break;
+      case PowerUpType.star:
+        glowColor = const Color(0xffff4081);
+        break;
+    }
+
+    // Outer glow
+    canvas.drawCircle(
+      pu.position,
+      pu.radius * (1.2 + pulse * .3),
+      Paint()
+        ..color = glowColor.withValues(alpha: .2 * pulse)
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 8),
+    );
+
+    // Orb body
+    canvas.drawCircle(
+      pu.position,
+      pu.radius * pulse,
+      Paint()
+        ..color = glowColor.withValues(alpha: .7)
+        ..style = PaintingStyle.fill,
+    );
+
+    // Inner highlight
+    canvas.drawCircle(
+      pu.position,
+      pu.radius * .5 * pulse,
+      Paint()..color = Colors.white.withValues(alpha: .6),
+    );
+
+    // Label
+    _drawCenteredText(
+      canvas,
+      pu.label,
+      pu.position,
+      15,
+      Colors.white,
+      FontWeight.w900,
+    );
+  }
+
+  // ─── Obstacle rendering ───
+
+  void _drawObstacle(Canvas canvas, Obstacle obs) {
+    switch (obs.type) {
+      case ObstacleType.hook:
+        _drawHook(canvas, obs);
+        break;
+      case ObstacleType.whirlpool:
+        _drawWhirlpool(canvas, obs);
+        break;
+      case ObstacleType.aiShark:
+        _drawAiShark(canvas, obs);
+        break;
+      case ObstacleType.poisonTide:
+        _drawPoisonTideObs(canvas, obs);
+        break;
+      case ObstacleType.reef:
+        _drawReef(canvas, obs);
+        break;
+      case ObstacleType.current:
+        _drawCurrent(canvas, obs);
+        break;
+    }
+  }
+
+  void _drawHook(Canvas canvas, Obstacle obs) {
+    final dropY = obs.position.dy + obs.timer * 180;
+    if (dropY > world.height * .9) return;
+
+    final hookPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 3
+      ..strokeCap = StrokeCap.round
+      ..color = const Color(0xff8899aa);
+    final linePaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.5
+      ..color = const Color(0xff556677).withValues(alpha: .7);
+
+    // Line from top
+    canvas.drawLine(
+      Offset(obs.position.dx, 0),
+      Offset(obs.position.dx, dropY),
+      linePaint,
+    );
+
+    // Hook shape
+    final path = Path()
+      ..moveTo(obs.position.dx - obs.width * .3, dropY - obs.height * .5)
+      ..cubicTo(
+        obs.position.dx - obs.width * .2,
+        dropY + obs.height * .2,
+        obs.position.dx + obs.width * .2,
+        dropY + obs.height * .3,
+        obs.position.dx + obs.width * .1,
+        dropY - obs.height * .2,
+      );
+    canvas.drawPath(path, hookPaint);
+
+    // Warning glow
+    canvas.drawCircle(
+      Offset(obs.position.dx, dropY),
+      30,
+      Paint()
+        ..color = const Color(0xffff4444).withValues(alpha: .15)
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 6),
+    );
+  }
+
+  void _drawWhirlpool(Canvas canvas, Obstacle obs) {
+    final anim = sin(obs.timer * 2) * .5 + .5;
+    final center = obs.position;
+
+    for (var i = 0; i < 3; i++) {
+      final r = obs.radius * (.5 + .15 * i) * (.8 + anim * .2);
+      canvas.drawCircle(
+        center + Offset(sin(obs.timer + i) * 8, cos(obs.timer + i) * 8),
+        r,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2
+          ..color = const Color(0xff4488aa).withValues(
+            alpha: .4 - i * .1,
+          ),
+      );
+    }
+    canvas.drawCircle(
+      center,
+      12,
+      Paint()..color = const Color(0xff1a3344).withValues(alpha: .6),
+    );
+  }
+
+  void _drawAiShark(Canvas canvas, Obstacle obs) {
+    final direction = obs.velocity.distance > .1
+        ? obs.velocity / obs.velocity.distance
+        : const Offset(1, 0);
+    final angle = atan2(direction.dy, direction.dx);
+
+    canvas.save();
+    canvas.translate(obs.position.dx, obs.position.dy);
+    canvas.rotate(angle);
+
+    // Shark body
+    final bodyPaint = Paint()
+      ..isAntiAlias = true
+      ..color = const Color(0xffcc3333).withValues(alpha: .8);
+    final body = Path()
+      ..moveTo(-50, -18)
+      ..cubicTo(-20, -28, 30, -26, 55, -6)
+      ..cubicTo(65, 0, 65, 0, 55, 6)
+      ..cubicTo(30, 26, -20, 28, -50, 18)
+      ..close();
+    canvas.drawPath(body, bodyPaint);
+
+    // Dorsal fin
+    final finPaint = Paint()
+      ..isAntiAlias = true
+      ..color = const Color(0xff881111).withValues(alpha: .85);
+    canvas.drawPath(
+      Path()
+        ..moveTo(-10, -20)
+        ..lineTo(5, -42)
+        ..lineTo(18, -20)
+        ..close(),
+      finPaint,
+    );
+
+    // Eye
+    canvas.drawCircle(const Offset(38, -8), 4, Paint()..color = Colors.white);
+    canvas.drawCircle(
+      const Offset(39, -8),
+      2,
+      Paint()..color = Colors.black,
+    );
+
+    // Warning label
+    _drawCenteredText(
+      canvas,
+      '🦈',
+      Offset(0, -32),
+      18,
+      Colors.white,
+      FontWeight.w900,
+    );
+
+    canvas.restore();
+  }
+
+  void _drawPoisonTideObs(Canvas canvas, Obstacle obs) {
+    final paint = Paint()
+      ..color = const Color(0xff4caf50).withValues(alpha: .25)
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 12);
+    canvas.drawCircle(obs.position, obs.radius, paint);
+
+    // Inner bubbles
+    final innerPaint = Paint()
+      ..color = const Color(0xff66bb6a).withValues(alpha: .15);
+    for (var i = 0; i < 6; i++) {
+      final a = i * pi / 3 + obs.timer;
+      canvas.drawCircle(
+        obs.position + Offset(cos(a), sin(a)) * obs.radius * .5,
+        obs.radius * .18,
+        innerPaint,
+      );
+    }
+
+    _drawCenteredText(
+      canvas,
+      '☠',
+      obs.position,
+      16,
+      const Color(0xff4caf50),
+      FontWeight.w900,
+    );
+  }
+
+  void _drawReef(Canvas canvas, Obstacle obs) {
+    final paint = Paint()
+      ..isAntiAlias = true
+      ..color = const Color(0xff5d4037).withValues(alpha: .75);
+    final path = Path();
+    final sides = 7;
+    for (var i = 0; i < sides; i++) {
+      final a = i * 2 * pi / sides - pi / 2;
+      final r = obs.radius * (.7 + .3 * ((i * 37) % 100) / 100);
+      final x = obs.position.dx + cos(a) * r;
+      final y = obs.position.dy + sin(a) * r;
+      if (i == 0) {
+        path.moveTo(x, y);
+      } else {
+        path.lineTo(x, y);
+      }
+    }
+    path.close();
+    canvas.drawPath(path, paint);
+
+    final shadowPaint = Paint()
+      ..isAntiAlias = true
+      ..color = const Color(0xff3e2723).withValues(alpha: .4);
+    canvas.drawPath(path, shadowPaint..style = PaintingStyle.stroke..strokeWidth = 3);
+  }
+
+  void _drawCurrent(Canvas canvas, Obstacle obs) {
+    final dir = Offset(cos(obs.angle), sin(obs.angle));
+    final perp = Offset(-dir.dy, dir.dx);
+
+    // Direction arrows
+    final arrowPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2
+      ..strokeCap = StrokeCap.round
+      ..color = const Color(0xff4488cc).withValues(alpha: .5);
+    for (var i = -2; i <= 2; i++) {
+      final base = obs.position + perp * (i * obs.width * .18);
+      canvas.drawLine(
+        base - dir * obs.width * .4,
+        base + dir * obs.width * .4,
+        arrowPaint,
+      );
+      // Arrowhead
+      final tip = base + dir * obs.width * .45;
+      canvas.drawLine(
+        tip,
+        tip - dir * 18 + perp * 10,
+        arrowPaint,
+      );
+      canvas.drawLine(
+        tip,
+        tip - dir * 18 - perp * 10,
+        arrowPaint,
+      );
+    }
+  }
+
+  // ─── Effects rendering ───
+
+  void _drawPoisonTrail(Canvas canvas) {
+    for (var i = 0; i < poisonTrail.length; i++) {
+      final alpha = .08 + (i / poisonTrail.length) * .15;
+      final radius = 15 + (i / poisonTrail.length) * 25;
+      canvas.drawCircle(
+        poisonTrail[i],
+        radius,
+        Paint()
+          ..color = const Color(0xff4caf50).withValues(alpha: alpha)
+          ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 6),
+      );
+    }
+  }
+
+  void _drawSonicWave(Canvas canvas) {
+    for (var i = 0; i < 2; i++) {
+      final r = sonicWaveRadius - i * 40;
+      if (r < 0) continue;
+      canvas.drawCircle(
+        player,
+        r,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 3 - i * .5
+          ..color = const Color(0xff4488ff)
+              .withValues(alpha: max(0, .5 - i * .2)),
+      );
+    }
+  }
+
+  // ─── Seaweed ───
 
   void _drawSeaweed(Canvas canvas, {required bool front}) {
     for (final patch in seaweed) {

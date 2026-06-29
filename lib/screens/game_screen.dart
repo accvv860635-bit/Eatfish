@@ -11,7 +11,10 @@ import '../models/fish_entity.dart';
 import '../models/fish_spec.dart';
 import '../models/game_map.dart';
 import '../models/game_record.dart';
+import '../models/obstacle.dart';
+import '../models/power_up.dart';
 import '../models/seaweed_patch.dart';
+import '../models/skill_def.dart';
 import '../painters/fish_game_painter.dart';
 import '../services/storage_service.dart';
 
@@ -36,17 +39,21 @@ class _GameScreenState extends State<GameScreen>
   static const int maxLevel = FishSpecs.maxLevel;
   static const double worldWidthScale = 12.0;
   static const double worldHeightScale = 1.8;
+  static const double _boostSpeedMult = 2.0;
+  static const double _boostSizeDrain = 0.05;
+  static const int _maxPowerUpsOnMap = 3;
 
   final Random _random = Random();
   final List<FishEntity> _fish = [];
   final List<SeaweedPatch> _seaweed = [];
+  final List<PowerUp> _powerUps = [];
+  final List<ActiveEffect> _activeEffects = [];
+  final List<Obstacle> _obstacles = [];
   late final Ticker _ticker;
 
-  // 圖片資源
   ui.Image? _fishImage;
   ui.Image? _bgImage;
 
-  // 座標系統
   Size _screen = Size.zero;
   Size _world = Size.zero;
   Offset _player = Offset.zero;
@@ -56,11 +63,9 @@ class _GameScreenState extends State<GameScreen>
   Duration _lastTick = Duration.zero;
   int _fishCount = 40;
 
-  // 點擊指示器
   Offset? _tapWorldPos;
   double _tapAlpha = 0.0;
 
-  // 遊戲狀態
   int _level = 1;
   int _xp = 0;
   int _hp = 100;
@@ -72,7 +77,6 @@ class _GameScreenState extends State<GameScreen>
   double _runTime = 0;
   double _comboTimer = 0;
   double _feedbackTimer = 0;
-  double _hurtCooldown = 0;
   double _spawnGraceTimer = 0;
   double _biteTimer = 0;
   bool _gameOver = false;
@@ -85,11 +89,42 @@ class _GameScreenState extends State<GameScreen>
   Offset? _joystickCurrent;
   String _feedbackText = '';
 
+  // ─── Boost ───
+  bool _isBoosting = false;
+  double _playerSizeMultiplier = 1.0;
+  double _initialPlayerSize = 0;
+
+  // ─── Power-ups ───
+  double _powerUpSpawnTimer = 0;
+
+  // ─── Skills ───
+  double _skillCooldown = 0;
+  double _skillEffectTimer = 0;
+  int _skillEatCount = 0;
+  final List<FishEntity> _summonedFish = [];
+  double _summonTimer = 0;
+  double _sonicWaveRadius = 0;
+
+  // ─── Obstacles ───
+  double _hookTimer = 0;
+  double _poisonTideTimer = 0;
+  double _sharkTimer = 0;
+
+  // ─── Poison trail ───
+  final List<Offset> _poisonTrail = [];
+  static const double _poisonTrailRadius = 60;
+
   int get _xpGoal => _level >= maxLevel ? 0 : 28 + (_level * 16);
   int get _secondsSurvived => _runTime.floor();
   double get _cameraZoom => (1.0 - (_level - 1) * .022).clamp(.62, 1.0);
   Size get _visibleWorldSize =>
       Size(_screen.width / _cameraZoom, _screen.height / _cameraZoom);
+
+  bool get _isInvincible =>
+      _activeEffects.any((e) =>
+          e.type == PowerUpType.shield ||
+          e.type == PowerUpType.star) ||
+      (_skillEffectTimer > 0 && _level == 1);
 
   @override
   void initState() {
@@ -100,6 +135,38 @@ class _GameScreenState extends State<GameScreen>
     _ticker = createTicker(_tick)..start();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+    HardwareKeyboard.instance.addHandler(_onKeyEvent);
+  }
+
+  bool _onKeyEvent(KeyEvent event) {
+    if (_gameOver || _isPaused) return false;
+    if (event is KeyDownEvent) {
+      if (event.logicalKey == LogicalKeyboardKey.space) {
+        _startBoosting();
+        return true;
+      }
+      if (event.logicalKey == LogicalKeyboardKey.keyQ ||
+          event.logicalKey == LogicalKeyboardKey.keyE) {
+        _useSkill();
+        return true;
+      }
+    }
+    if (event is KeyUpEvent) {
+      if (event.logicalKey == LogicalKeyboardKey.space) {
+        _stopBoosting();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void _startBoosting() {
+    if (_playerSizeMultiplier <= _initialPlayerSize * .15) return;
+    _isBoosting = true;
+  }
+
+  void _stopBoosting() {
+    _isBoosting = false;
   }
 
   Future<void> _loadPrefs() async {
@@ -118,15 +185,12 @@ class _GameScreenState extends State<GameScreen>
     final bgData = await rootBundle.load(
       (widget.gameMap ?? GameMaps.all.first).assetPath,
     );
-
     final fishCodec = await ui.instantiateImageCodec(
       fishData.buffer.asUint8List(),
     );
     final bgCodec = await ui.instantiateImageCodec(bgData.buffer.asUint8List());
-
     final fishFrame = await fishCodec.getNextFrame();
     final bgFrame = await bgCodec.getNextFrame();
-
     if (mounted) {
       setState(() {
         _fishImage = fishFrame.image;
@@ -138,18 +202,15 @@ class _GameScreenState extends State<GameScreen>
   @override
   void dispose() {
     _ticker.dispose();
+    HardwareKeyboard.instance.removeHandler(_onKeyEvent);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     SystemChrome.setPreferredOrientations(DeviceOrientation.values);
     super.dispose();
   }
 
-  // ─── 重置 ───
-
   void _reset(Size screenSize) {
     _screen = screenSize;
     _world = _worldSizeFor(screenSize);
-
-    // 玩家在世界正中央
     _level = 1;
     _player = Offset(_world.width / 2, _world.height / 2);
     _targetPosition = _player;
@@ -167,7 +228,6 @@ class _GameScreenState extends State<GameScreen>
     _comboTimer = 0;
     _feedbackTimer = 0;
     _feedbackText = '';
-    _hurtCooldown = 0;
     _spawnGraceTimer = 1.6;
     _biteTimer = 0;
     _gameOver = false;
@@ -176,6 +236,29 @@ class _GameScreenState extends State<GameScreen>
     _isPaused = false;
     _tapAlpha = 0;
     _tapWorldPos = null;
+
+    _isBoosting = false;
+    _playerSizeMultiplier = 1.0;
+    _initialPlayerSize = _fishLength(1);
+
+    _powerUps.clear();
+    _activeEffects.clear();
+    _powerUpSpawnTimer = _random.nextDouble() * 5 + 15;
+
+    _skillCooldown = 0;
+    _skillEffectTimer = 0;
+    _skillEatCount = 0;
+    _summonedFish.clear();
+    _summonTimer = 0;
+    _sonicWaveRadius = 0;
+
+    _obstacles.clear();
+    _hookTimer = 25 + _random.nextDouble() * 10;
+    _poisonTideTimer = 15 + _random.nextDouble() * 15;
+    _sharkTimer = 35 + _random.nextDouble() * 20;
+
+    _poisonTrail.clear();
+
     _fish.clear();
     _seaweed
       ..clear()
@@ -184,9 +267,12 @@ class _GameScreenState extends State<GameScreen>
     for (var i = 0; i < _fishCount; i++) {
       _fish.add(_spawnFish(nearPlayer: i < nearbyFishCount));
     }
-  }
 
-  // ─── 攝影機 ───
+    // Spawn initial obstacles
+    _spawnReefs();
+    _spawnWhirlpools();
+    _spawnCurrents();
+  }
 
   Offset _clampCamera(Offset desired) {
     final visible = _visibleWorldSize;
@@ -202,8 +288,6 @@ class _GameScreenState extends State<GameScreen>
       screenSize.height * worldHeightScale,
     );
   }
-
-  // ─── 生成魚 ───
 
   List<SeaweedPatch> _generateSeaweed() {
     final patches = <SeaweedPatch>[];
@@ -332,7 +416,7 @@ class _GameScreenState extends State<GameScreen>
     return minLevel + _random.nextInt(maxSpawnLevel - minLevel + 1);
   }
 
-  // ─── 主迴圈 ───
+  // ─── Main loop ───
 
   void _tick(Duration elapsed) {
     if (_lastTick == Duration.zero) {
@@ -350,10 +434,19 @@ class _GameScreenState extends State<GameScreen>
     }
 
     _updatePlayer(dt);
+    _updateBoost(dt);
     _updateCamera(dt);
     _updateFish(dt);
     _resolveCollisions();
+    _updateActiveEffects(dt);
+    _updatePowerUps(dt);
+    _updateObstacles(dt);
+    _updateSkillCooldown(dt);
+    _updatePoisonTrail(dt);
+    _resolvePowerUpCollisions();
+    _resolveObstacleCollisions();
     _updateTapIndicator(dt);
+
     _runTime += dt;
     _biteTimer = max(0, _biteTimer - dt);
     _comboTimer = max(0, _comboTimer - dt);
@@ -364,7 +457,7 @@ class _GameScreenState extends State<GameScreen>
     setState(() {});
   }
 
-  // ─── 存檔 ───
+  // ─── Save ───
 
   Future<void> _saveGameRecord() async {
     _savedRecord = true;
@@ -380,10 +473,9 @@ class _GameScreenState extends State<GameScreen>
     );
   }
 
-  // ─── 玩家移動 ───
+  // ─── Player movement ───
 
   void _updatePlayer(double dt) {
-    // 按住跟隨模式：持續朝目標移動
     if (_isChasing) {
       final toTarget = _targetPosition - _player;
       if (toTarget.distance > 3) {
@@ -392,9 +484,11 @@ class _GameScreenState extends State<GameScreen>
     }
 
     final speed = _playerSpeedForLevel(_level);
-    _player += _heading * speed * dt;
+    final boostMult = _isBoosting ? _boostSpeedMult : 1.0;
+    final effectSpeedMult = 1.0 +
+        (_activeEffects.any((e) => e.type == PowerUpType.boost) ? .6 : 0);
+    _player += _heading * speed * boostMult * effectSpeedMult * dt;
 
-    // 世界邊界夾制
     final playerLength = _fishLength(_level);
     final xMargin = max(22.0, playerLength * .42);
     final yMargin = max(26.0, playerLength * .32);
@@ -403,11 +497,38 @@ class _GameScreenState extends State<GameScreen>
       _player.dy.clamp(yMargin, _world.height - yMargin),
     );
 
-    _hurtCooldown = max(0, _hurtCooldown - dt);
     _spawnGraceTimer = max(0, _spawnGraceTimer - dt);
+
+    // Poison trail
+    if (_activeEffects.any((e) => e.type == PowerUpType.poison)) {
+      _poisonTrail.add(_player);
+      if (_poisonTrail.length > 80) {
+        _poisonTrail.removeAt(0);
+      }
+    }
   }
 
-  // ─── 攝影機跟隨 ───
+  // ─── Boost ───
+
+  void _updateBoost(double dt) {
+    final canBoost =
+        _playerSizeMultiplier > _initialPlayerSize * .15;
+    if (_isBoosting && canBoost) {
+      _playerSizeMultiplier = max(
+        _initialPlayerSize * .15,
+        _playerSizeMultiplier - _boostSizeDrain * dt,
+      );
+    } else if (!_isBoosting) {
+      _playerSizeMultiplier = min(
+        1.0,
+        _playerSizeMultiplier + _boostSizeDrain * .5 * dt,
+      );
+    } else {
+      _isBoosting = false;
+    }
+  }
+
+  // ─── Camera ───
 
   void _updateCamera(double dt) {
     final visible = _visibleWorldSize;
@@ -419,7 +540,7 @@ class _GameScreenState extends State<GameScreen>
     _camera = Offset.lerp(_camera, target, min(1, dt * 3.5))!;
   }
 
-  // ─── 點擊指示器 ───
+  // ─── Tap indicator ───
 
   void _updateTapIndicator(double dt) {
     if (_tapAlpha > 0) {
@@ -427,14 +548,16 @@ class _GameScreenState extends State<GameScreen>
     }
   }
 
-  // ─── 魚 AI ───
+  // ─── Fish AI ───
 
   void _updateFish(double dt) {
     const margin = 160.0;
     final playerHidden = _isInSeaweed(_player);
     final playerNoise = _isChasing ? 1.0 : .58;
-    for (var i = 0; i < _fish.length; i++) {
-      final fish = _fish[i];
+    final allFish = [..._fish, ..._summonedFish];
+
+    for (var i = 0; i < allFish.length; i++) {
+      final fish = allFish[i];
       fish.wanderTimer -= dt;
       fish.chaseTimer -= dt;
       fish.restTimer -= dt;
@@ -446,6 +569,38 @@ class _GameScreenState extends State<GameScreen>
           : max(0.0, fish.hiddenTimer - dt * 1.4);
       fish.stunnedTimer = max(0, fish.stunnedTimer - dt);
 
+      // Poison trail slow
+      var slowMult = 1.0;
+      for (final p in _poisonTrail) {
+        if ((fish.position - p).distance < _poisonTrailRadius) {
+          slowMult = .35;
+          break;
+        }
+      }
+      // Sonic wave slow
+      if (_sonicWaveRadius > 0) {
+        final dist = (fish.position - _player).distance;
+        if (dist < _sonicWaveRadius && dist > _sonicWaveRadius * .3) {
+          slowMult = min(slowMult, .3);
+        }
+      }
+      // Vortex attraction
+      if (_activeEffects.any((e) => e.type == PowerUpType.vortex)) {
+        final dist = (fish.position - _player).distance;
+        if (dist < 260 && dist > 30) {
+          final pull = _normalize(_player - fish.position) * 180 * dt;
+          fish.position += pull * slowMult;
+        }
+      }
+      // Magnet attraction (only smaller fish)
+      if (_activeEffects.any((e) => e.type == PowerUpType.magnet)) {
+        final dist = (fish.position - _player).distance;
+        if (dist < 280 && fish.level < _level && dist > 30) {
+          final pull = _normalize(_player - fish.position) * 200 * dt;
+          fish.position += pull * slowMult;
+        }
+      }
+
       if (fish.stunnedTimer > 0) {
         fish.behaviorState = FishBehaviorState.stunned;
         fish.velocity = Offset.lerp(
@@ -453,7 +608,7 @@ class _GameScreenState extends State<GameScreen>
           Offset.zero,
           min(1, dt * 3),
         )!;
-        fish.position += fish.velocity * dt;
+        fish.position += fish.velocity * dt * slowMult;
         continue;
       }
 
@@ -534,50 +689,78 @@ class _GameScreenState extends State<GameScreen>
         min(1, dt * turnRate),
       )!;
       final depthSpeed = ui.lerpDouble(.72, 1.16, fish.depth)!;
-      fish.position += fish.velocity * depthSpeed * dt;
+      fish.position += fish.velocity * depthSpeed * slowMult * dt;
 
-      // 超出世界邊界 → 重生
       if (fish.position.dx < -margin ||
           fish.position.dx > _world.width + margin ||
           fish.position.dy < -margin ||
           fish.position.dy > _world.height + margin) {
-        _fish[i] = _spawnFish(awayFromPlayer: _player);
+        if (i < _fish.length) {
+          _fish[i] = _spawnFish(awayFromPlayer: _player);
+        }
       }
     }
   }
 
-  // ─── 碰撞 ───
+  // ─── Collisions ───
 
   void _resolveCollisions() {
-    final playerRadius = _fishLength(_level) * .28;
+    final playerRadius = _fishLength(_level) * .28 *
+        _playerSizeMultiplier;
+    final starActive = _activeEffects.any((e) => e.type == PowerUpType.star);
+    final skillL3Active = _level == 3 && _skillEffectTimer > 0;
+    var eatRangeMultiplier = 1.0;
+    if (_level == 4 && _skillEffectTimer > 0) eatRangeMultiplier = 1.5;
+
     for (var i = 0; i < _fish.length; i++) {
       final fish = _fish[i];
       final radius =
           _fishLength(fish.level, fish.sizeScale) *
           ui.lerpDouble(.22, .31, fish.depth)!;
-      if ((_player - fish.position).distance > playerRadius + radius) {
+      final dist = (_player - fish.position).distance;
+      final eatRange = (playerRadius + radius) * eatRangeMultiplier;
+
+      if (dist > playerRadius + radius && dist > eatRange) {
         continue;
       }
 
       final canTailBite = fish.level == _level + 1 && _isPlayerBitingTail(fish);
-      if (fish.level <= _level || canTailBite) {
+
+      if (fish.level <= _level || canTailBite || starActive) {
         final spec = FishSpecs.byLevel(fish.level);
         final revengeBonus =
-            canTailBite ||
-            fish.behaviorState == FishBehaviorState.chase ||
-            fish.behaviorState == FishBehaviorState.attack;
+            !starActive &&
+            (canTailBite ||
+                fish.behaviorState == FishBehaviorState.chase ||
+                fish.behaviorState == FishBehaviorState.attack);
         _combo = _comboTimer > 0 ? _combo + 1 : 1;
         _bestCombo = max(_bestCombo, _combo);
         _comboTimer = 2.4;
         final comboBonus = _combo >= 3 ? (_combo - 2) * 20 : 0;
-        _score += spec.score + comboBonus + (revengeBonus ? spec.score : 0);
+        final doubleMult =
+            _activeEffects.any((e) => e.type == PowerUpType.doubleScore)
+                ? 2
+                : 1;
+        _score +=
+            (spec.score + comboBonus + (revengeBonus ? spec.score : 0)) *
+                doubleMult;
         _xp += spec.xp + (revengeBonus ? spec.xp ~/ 2 : 0);
         if (revengeBonus) {
           _revengeKills += 1;
-          _showFeedback('反殺 +${spec.score}');
+          _showFeedback('反殺 +${spec.score * doubleMult}');
+        } else if (starActive) {
+          _showFeedback('⭐ +${spec.score * doubleMult}');
         } else if (_combo >= 3) {
           _showFeedback('連吃 $_combo');
         }
+
+        // Skill L4: reduce cooldown per eat
+        if (_level == 4 && _skillEffectTimer > 0) {
+          _skillCooldown = max(0, _skillCooldown - .5);
+          _skillEatCount++;
+          _showFeedback('狂咬 x$_skillEatCount');
+        }
+
         _biteTimer = .24;
         _fish[i] = _spawnFish(awayFromPlayer: _player);
         while (_level < maxLevel && _xp >= _xpGoal) {
@@ -585,25 +768,45 @@ class _GameScreenState extends State<GameScreen>
           _level += 1;
           _showFeedback('升級 Lv.$_level');
         }
-      } else if (_hurtCooldown <= 0 && _spawnGraceTimer <= 0) {
+      } else if (_spawnGraceTimer <= 0) {
+        if (_isInvincible) {
+          // Shield: knock back attacker
+          if (_activeEffects.any((e) => e.type == PowerUpType.shield)) {
+            final away = _normalize(fish.position - _player);
+            fish.position += away * 140;
+            fish.velocity = away * _cruiseSpeedForFish(fish) * 1.5;
+            fish.stunnedTimer = .6;
+          }
+          continue;
+        }
+        if (skillL3Active) {
+          final away = _normalize(fish.position - _player);
+          fish.position += away * 180;
+          fish.velocity = away * _cruiseSpeedForFish(fish) * 2;
+          fish.stunnedTimer = .8;
+          continue;
+        }
         final isAttacking =
             fish.behaviorState == FishBehaviorState.attack ||
             fish.biteProgress > 0;
         if (!isAttacking) {
-          fish.behaviorState = FishBehaviorState.warn;
-          fish.attackWindup = max(fish.attackWindup, .28);
-          continue;
+          if (fish.restTimer > 0) {
+            // Fish is resting after previous bite, push player away
+            _player -= _heading * 18;
+            continue;
+          }
+          // Direct body collision: fish bites immediately, rest afterwards
+          fish.biteProgress = .42;
+          fish.behaviorState = FishBehaviorState.attack;
         }
         final spec = FishSpecs.byLevel(fish.level);
         final hidingReduction = _isInSeaweed(_player) ? .55 : 1.0;
         final damage = (spec.damage * hidingReduction).round();
         _hp = max(0, _hp - damage);
-        _hurtCooldown = .75;
         fish.biteProgress = 0;
         fish.restTimer = max(fish.restTimer, 1.1);
         fish.behaviorState = FishBehaviorState.rest;
         _player -= _heading * 28;
-        // 碰撞反彈後重新夾制邊界
         final playerLength = _fishLength(_level);
         _player = Offset(
           _player.dx.clamp(
@@ -619,6 +822,71 @@ class _GameScreenState extends State<GameScreen>
           _gameOver = true;
           _showFeedback('');
         }
+      }
+    }
+
+    // ─── Fish vs fish collisions ───
+    _resolveFishFishCollisions();
+
+    // Collision with summoned fish (skill L2)
+    for (var i = 0; i < _summonedFish.length; i++) {
+      final fish = _summonedFish[i];
+      final radius = _fishLength(fish.level, fish.sizeScale) *
+          ui.lerpDouble(.22, .31, fish.depth)!;
+      if ((_player - fish.position).distance > playerRadius + radius) continue;
+      final spec = FishSpecs.byLevel(fish.level);
+      _combo = _comboTimer > 0 ? _combo + 1 : 1;
+      _bestCombo = max(_bestCombo, _combo);
+      _comboTimer = 2.4;
+      final comboBonus = _combo >= 3 ? (_combo - 2) * 20 : 0;
+      final doubleMult =
+          _activeEffects.any((e) => e.type == PowerUpType.doubleScore)
+              ? 2
+              : 1;
+      _score += (spec.score + comboBonus) * doubleMult;
+      _xp += spec.xp;
+      _biteTimer = .24;
+      _summonedFish.removeAt(i);
+      i--;
+      while (_level < maxLevel && _xp >= _xpGoal) {
+        _xp -= _xpGoal;
+        _level += 1;
+        _showFeedback('升級 Lv.$_level');
+      }
+    }
+  }
+
+  void _resolveFishFishCollisions() {
+    for (var a = 0; a < _fish.length; a++) {
+      final fishA = _fish[a];
+      if (fishA.level < 2) continue;
+      final radiusA =
+          _fishLength(fishA.level, fishA.sizeScale) *
+          ui.lerpDouble(.22, .31, fishA.depth)!;
+
+      for (var b = a + 1; b < _fish.length; b++) {
+        final fishB = _fish[b];
+        final levelDiff = (fishA.level - fishB.level).abs();
+        if (levelDiff < 2) continue;
+
+        final radiusB =
+            _fishLength(fishB.level, fishB.sizeScale) *
+            ui.lerpDouble(.22, .31, fishB.depth)!;
+        final dist = (fishA.position - fishB.position).distance;
+        if (dist > radiusA + radiusB) continue;
+
+        final bigger = fishA.level > fishB.level ? fishA : fishB;
+        final smaller = fishA.level > fishB.level ? fishB : fishA;
+        final smallerIdx = fishA.level > fishB.level ? b : a;
+        if (smaller.level < 2) continue;
+        if (bigger.restTimer > 0) continue;
+
+        // Smaller fish gets eaten/killed by bigger — respawn it
+        _fish[smallerIdx] = _spawnFish(awayFromPlayer: smaller.position);
+        bigger.restTimer = max(bigger.restTimer, .6);
+        bigger.behaviorState = FishBehaviorState.rest;
+        // Break inner loop since fish array was modified
+        break;
       }
     }
   }
@@ -670,175 +938,627 @@ class _GameScreenState extends State<GameScreen>
     return value / length;
   }
 
-  // ─── 螢幕座標 → 世界座標 ───
+  // ─── Power-ups ───
+
+  void _updatePowerUps(double dt) {
+    _powerUpSpawnTimer -= dt;
+    if (_powerUpSpawnTimer <= 0 && _powerUps.length < _maxPowerUpsOnMap) {
+      _spawnPowerUp();
+      _powerUpSpawnTimer = 15 + _random.nextDouble() * 10;
+    }
+
+    for (var i = _powerUps.length - 1; i >= 0; i--) {
+      _powerUps[i].timer += dt;
+      if (_powerUps[i].timer >= _powerUps[i].lifetime) {
+        _powerUps.removeAt(i);
+      }
+    }
+  }
+
+  void _spawnPowerUp() {
+    final types = PowerUpType.values;
+    final weights = [22, 20, 12, 10, 6, 5, 3]; // rarity weights
+    var total = 0;
+    for (final w in weights) {
+      total += w;
+    }
+    var roll = _random.nextInt(total);
+    var idx = 0;
+    for (var i = 0; i < weights.length; i++) {
+      roll -= weights[i];
+      if (roll < 0) {
+        idx = i;
+        break;
+      }
+    }
+
+    final margin = 100.0;
+    final pos = Offset(
+      margin + _random.nextDouble() * max(1, _world.width - margin * 2),
+      margin + _random.nextDouble() * max(1, _world.height - margin * 2),
+    );
+    _powerUps.add(PowerUp(type: types[idx], position: pos));
+  }
+
+  void _resolvePowerUpCollisions() {
+    for (var i = _powerUps.length - 1; i >= 0; i--) {
+      final pu = _powerUps[i];
+      if ((_player - pu.position).distance < pu.radius + _fishLength(_level) * .35) {
+        _applyPowerUpEffect(pu.type);
+        _powerUps.removeAt(i);
+      }
+    }
+  }
+
+  void _applyPowerUpEffect(PowerUpType type) {
+    double duration;
+    switch (type) {
+      case PowerUpType.boost:
+        duration = 5;
+        break;
+      case PowerUpType.magnet:
+        duration = 8;
+        break;
+      case PowerUpType.shield:
+        duration = 6;
+        break;
+      case PowerUpType.poison:
+        duration = 3;
+        break;
+      case PowerUpType.doubleScore:
+        duration = 10;
+        break;
+      case PowerUpType.vortex:
+        duration = 3;
+        break;
+      case PowerUpType.star:
+        duration = 5;
+        break;
+    }
+    // Remove existing effect of same type
+    _activeEffects.removeWhere((e) => e.type == type);
+    _activeEffects.add(ActiveEffect(type: type, remaining: duration));
+    _showFeedback('${puLabel(type)}!');
+  }
+
+  String puLabel(PowerUpType type) {
+    switch (type) {
+      case PowerUpType.boost:
+        return '⚡ 衝刺';
+      case PowerUpType.magnet:
+        return '🧲 磁鐵';
+      case PowerUpType.shield:
+        return '🛡 護盾';
+      case PowerUpType.poison:
+        return '💀 毒霧';
+      case PowerUpType.doubleScore:
+        return '✨ 雙倍';
+      case PowerUpType.vortex:
+        return '🌪 漩渦';
+      case PowerUpType.star:
+        return '💎 無敵星';
+    }
+  }
+
+  void _updateActiveEffects(double dt) {
+    for (var i = _activeEffects.length - 1; i >= 0; i--) {
+      _activeEffects[i].remaining -= dt;
+      if (_activeEffects[i].remaining <= 0) {
+        if (_activeEffects[i].type == PowerUpType.poison) {
+          _poisonTrail.clear();
+        }
+        _activeEffects.removeAt(i);
+      }
+    }
+  }
+
+  void _updatePoisonTrail(double dt) {
+    if (!_activeEffects.any((e) => e.type == PowerUpType.poison)) {
+      if (_poisonTrail.isNotEmpty) {
+        _poisonTrail.removeAt(0);
+      }
+    }
+    // Fade old trail points
+    if (_poisonTrail.length > 60) {
+      _poisonTrail.removeRange(0, _poisonTrail.length - 60);
+    }
+  }
+
+  // ─── Skills ───
+
+  void _updateSkillCooldown(double dt) {
+    _skillCooldown = max(0, _skillCooldown - dt);
+    _skillEffectTimer = max(0, _skillEffectTimer - dt);
+    _summonTimer = max(0, _summonTimer - dt);
+
+    // Sonic wave expansion
+    if (_level == 5 && _skillEffectTimer > 0) {
+      final elapsed = SkillDef.forLevel(5)!.cooldown - _skillCooldown;
+      _sonicWaveRadius = 40 + elapsed * 400;
+    } else {
+      _sonicWaveRadius = 0;
+    }
+
+    // Summon despawn
+    if (_summonTimer <= 0 && _summonedFish.isNotEmpty) {
+      _summonedFish.clear();
+    }
+
+    // Skill L3 inflate
+    if (_level == 3 && _skillEffectTimer <= 0 && _playerSizeMultiplier > 1.0) {
+      _playerSizeMultiplier = 1.0;
+    }
+  }
+
+  void _useSkill() {
+    if (_skillCooldown > 0) return;
+    final skill = SkillDef.forLevel(_level);
+    if (skill == null) return;
+
+    _skillCooldown = skill.cooldown;
+
+    switch (_level) {
+      case 1: // Dash
+        _skillEffectTimer = .3;
+        _player += _heading * _fishLength(_level) * 3;
+        _showFeedback('⚡ ${skill.name}');
+        break;
+      case 2: // Summon
+        _skillEffectTimer = 8;
+        _summonTimer = 8;
+        _summonedFish.clear();
+        for (var i = 0; i < 5; i++) {
+          final angle = _random.nextDouble() * pi * 2;
+          final dist = 60 + _random.nextDouble() * 40;
+          final pos = _player + Offset(cos(angle), sin(angle)) * dist;
+          _summonedFish.add(FishEntity(
+            position: pos,
+            velocity: _heading * 60,
+            level: max(1, _level - 2),
+            depth: _random.nextDouble(),
+            sizeScale: .85 + _random.nextDouble() * .1,
+            speedScale: .9,
+            predator: false,
+            chaseTimer: 0,
+            restTimer: 99,
+            wanderTimer: 99,
+            behaviorState: FishBehaviorState.wander,
+          ));
+        }
+        _showFeedback('🐟 ${skill.name}');
+        break;
+      case 3: // Inflate
+        _skillEffectTimer = 2;
+        _playerSizeMultiplier = 3.0;
+        _showFeedback('💥 ${skill.name}');
+        break;
+      case 4: // Blood rage
+        _skillEffectTimer = 3;
+        _skillEatCount = 0;
+        _showFeedback('🩸 ${skill.name}');
+        break;
+      case 5: // Sonic wave
+        _skillEffectTimer = .6;
+        _sonicWaveRadius = 40;
+        _showFeedback('🌊 ${skill.name}');
+        break;
+    }
+  }
+
+  // ─── Obstacles ───
+
+  void _updateObstacles(double dt) {
+    _hookTimer -= dt;
+    if (_hookTimer <= 0) {
+      _spawnHook();
+      _hookTimer = 25 + _random.nextDouble() * 10;
+    }
+
+    _poisonTideTimer -= dt;
+    if (_poisonTideTimer <= 0) {
+      _spawnPoisonTide();
+      _poisonTideTimer = 18 + _random.nextDouble() * 15;
+    }
+
+    _sharkTimer -= dt;
+    if (_sharkTimer <= 0) {
+      _spawnAiShark();
+      _sharkTimer = 35 + _random.nextDouble() * 25;
+    }
+
+    for (var i = _obstacles.length - 1; i >= 0; i--) {
+      final obs = _obstacles[i];
+      obs.timer += dt;
+
+      if (obs.type == ObstacleType.hook) {
+        if (obs.timer > obs.lifetime) {
+          _obstacles.removeAt(i);
+        }
+      } else if (obs.type == ObstacleType.aiShark) {
+        final toPlayer = _player - obs.position;
+        obs.velocity =
+            _normalize(toPlayer) * _playerSpeedForLevel(_level) * .85;
+        obs.position += obs.velocity * dt;
+        if (obs.timer > 45) _obstacles.removeAt(i);
+      } else if (obs.type == ObstacleType.poisonTide) {
+        if (obs.timer > obs.lifetime) _obstacles.removeAt(i);
+      } else if (obs.type == ObstacleType.whirlpool) {
+        for (final fish in [..._fish, ..._summonedFish]) {
+          final dist = (fish.position - obs.position).distance;
+          if (dist < obs.radius && dist > 10) {
+            final tangent = Offset(
+              -(fish.position.dy - obs.position.dy),
+              fish.position.dx - obs.position.dx,
+            );
+            fish.position +=
+                _normalize(tangent) * 60 * dt +
+                _normalize(obs.position - fish.position) * 40 * dt;
+          }
+        }
+      }
+    }
+  }
+
+  void _spawnHook() {
+    final margin = 100.0;
+    _obstacles.add(Obstacle(
+      type: ObstacleType.hook,
+      position: Offset(
+        margin + _random.nextDouble() * max(1, _world.width - margin * 2),
+        -30,
+      ),
+      lifetime: 5,
+      width: 40,
+      height: 80,
+    ));
+  }
+
+  void _spawnPoisonTide() {
+    final margin = 120.0;
+    _obstacles.add(Obstacle(
+      type: ObstacleType.poisonTide,
+      position: Offset(
+        margin + _random.nextDouble() * max(1, _world.width - margin * 2),
+        margin + _random.nextDouble() * max(1, _world.height - margin * 2),
+      ),
+      lifetime: 15,
+      radius: 70 + _random.nextDouble() * 60,
+    ));
+  }
+
+  void _spawnAiShark() {
+    final side = _random.nextInt(4);
+    Offset pos;
+    if (side == 0) {
+      pos = Offset(-60, _random.nextDouble() * _world.height);
+    } else if (side == 1) {
+      pos = Offset(_world.width + 60, _random.nextDouble() * _world.height);
+    } else if (side == 2) {
+      pos = Offset(_random.nextDouble() * _world.width, -60);
+    } else {
+      pos = Offset(_random.nextDouble() * _world.width, _world.height + 60);
+    }
+    _obstacles.add(Obstacle(
+      type: ObstacleType.aiShark,
+      position: pos,
+      radius: 70,
+      lifetime: 45,
+    ));
+  }
+
+  void _spawnReefs() {
+    final margin = 160.0;
+    for (var i = 0; i < 6; i++) {
+      _obstacles.add(Obstacle(
+        type: ObstacleType.reef,
+        position: Offset(
+          margin + _random.nextDouble() * max(1, _world.width - margin * 2),
+          _world.height * (.3 + _random.nextDouble() * .6),
+        ),
+        radius: 50 + _random.nextDouble() * 60,
+      ));
+    }
+  }
+
+  void _spawnWhirlpools() {
+    final margin = 200.0;
+    for (var i = 0; i < 3; i++) {
+      _obstacles.add(Obstacle(
+        type: ObstacleType.whirlpool,
+        position: Offset(
+          margin + _random.nextDouble() * max(1, _world.width - margin * 2),
+          _world.height * (.25 + _random.nextDouble() * .6),
+        ),
+        radius: 90 + _random.nextDouble() * 70,
+      ));
+    }
+  }
+
+  void _spawnCurrents() {
+    final margin = 200.0;
+    for (var i = 0; i < 4; i++) {
+      _obstacles.add(Obstacle(
+        type: ObstacleType.current,
+        position: Offset(
+          margin + _random.nextDouble() * max(1, _world.width - margin * 2),
+          _world.height * (.25 + _random.nextDouble() * .6),
+        ),
+        radius: 60,
+        width: 220 + _random.nextDouble() * 180,
+        height: 40,
+        angle: _random.nextDouble() * pi * 2,
+      ));
+    }
+  }
+
+  void _resolveObstacleCollisions() {
+    if (_isInvincible || _spawnGraceTimer > 0) return;
+
+    for (var i = _obstacles.length - 1; i >= 0; i--) {
+      final obs = _obstacles[i];
+      final dist = (_player - obs.position).distance;
+      final playerR = _fishLength(_level) * .28;
+
+      if (obs.type == ObstacleType.hook) {
+        if (dist < obs.width * .8 + playerR) {
+          _hp = max(0, _hp - 30);
+          _player -= _heading * 35;
+          _obstacles.removeAt(i);
+          if (_hp <= 0) _gameOver = true;
+        }
+      } else if (obs.type == ObstacleType.aiShark) {
+        if (dist < obs.radius * .6 + playerR) {
+          _hp = max(0, _hp - 50);
+          _player -= _heading * 40;
+          if (_hp <= 0) _gameOver = true;
+        }
+      } else if (obs.type == ObstacleType.poisonTide) {
+        if (dist < obs.radius + playerR) {
+          _hp = max(0, _hp - (5 * (1 / 20)).round());
+          if (_hp <= 0) _gameOver = true;
+        }
+      } else if (obs.type == ObstacleType.whirlpool) {
+        if (dist < obs.radius * .4) {
+          _player = Offset(
+            _random.nextDouble() * (_world.width - 200) + 100,
+            _random.nextDouble() * (_world.height - 200) + 100,
+          );
+        }
+      } else if (obs.type == ObstacleType.reef) {
+        if (dist < obs.radius * .7 + playerR) {
+          final away = _normalize(_player - obs.position);
+          _player += away * 50;
+          // Stun: freeze briefly
+          _isChasing = false;
+        }
+      } else if (obs.type == ObstacleType.current) {
+        if (dist < obs.width * .5) {
+          final dir = Offset(cos(obs.angle), sin(obs.angle));
+          _player += dir * 180 * (1 / 60);
+        }
+      }
+    }
+  }
+
+  // ─── Screen to world ───
 
   Offset _screenToWorld(Offset screenPos) {
     return _camera + screenPos / _cameraZoom;
   }
 
-  // ─── 建構 UI ───
+  // ─── Build ───
 
   @override
   Widget build(BuildContext context) {
     return PopScope(
       canPop: _gameOver,
-      child: LayoutBuilder(
-        builder: (context, constraints) {
-          final size = Size(constraints.maxWidth, constraints.maxHeight);
-          if (size.width > 0 && size.height > 0 && _screen == Size.zero) {
-            if (widget.debugStartAtGameOver && !_debugGameOverApplied) {
-              _debugGameOverApplied = true;
-              _screen = size;
-              _world = _worldSizeFor(size);
-              _player = Offset(_world.width / 2, _world.height / 2);
-              _level = 1;
-              _score = 0;
-              _hp = 0;
-              _gameOver = true;
-            } else if (_fishImage != null && _bgImage != null) {
-              WidgetsBinding.instance.addPostFrameCallback((_) {
-                if (mounted) setState(() => _reset(size));
-              });
+      child: Focus(
+        autofocus: true,
+        onKeyEvent: (node, event) => KeyEventResult.ignored,
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final size = Size(constraints.maxWidth, constraints.maxHeight);
+            if (size.width > 0 && size.height > 0 && _screen == Size.zero) {
+              if (widget.debugStartAtGameOver && !_debugGameOverApplied) {
+                _debugGameOverApplied = true;
+                _screen = size;
+                _world = _worldSizeFor(size);
+                _player = Offset(_world.width / 2, _world.height / 2);
+                _level = 1;
+                _score = 0;
+                _hp = 0;
+                _gameOver = true;
+              } else if (_fishImage != null && _bgImage != null) {
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (mounted) setState(() => _reset(size));
+                });
+              }
             }
-          }
 
-          return Stack(
-            fit: StackFit.expand,
-            children: [
-              // 遊戲世界層（含攝影機平移）
-              if (_screen != Size.zero && _bgImage != null)
-                Positioned.fill(
-                  child: ClipRect(
-                    child: GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onPanStart: _onPanStart,
-                      onPanUpdate: _onPanUpdate,
-                      onPanEnd: _onPanEnd,
-                      child: Stack(
-                        children: [
-                          CustomPaint(
-                            painter: WorldBackgroundPainter(
-                              bgImage: _bgImage!,
-                              world: _world,
-                              camera: _camera,
-                              zoom: _cameraZoom,
-                              screen: _screen,
-                            ),
-                          ),
-                          if (_fishImage != null)
+            return Stack(
+              fit: StackFit.expand,
+              children: [
+                if (_screen != Size.zero && _bgImage != null)
+                  Positioned.fill(
+                    child: ClipRect(
+                      child: GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onPanStart: _onPanStart,
+                        onPanUpdate: _onPanUpdate,
+                        onPanEnd: _onPanEnd,
+                        child: Stack(
+                          children: [
                             CustomPaint(
-                              painter: FishGamePainter(
-                                fishImage: _fishImage!,
-                                fish: _fish,
-                                player: _player,
-                                playerLevel: _level,
-                                playerHeading: _heading,
-                                hurt: _hurtCooldown > 0,
-                                playerHidden: _isInSeaweed(_player),
-                                playerBite: sin(
-                                  (1 - (_biteTimer / .24).clamp(0.0, 1.0)) * pi,
-                                ),
-                                seaweed: _seaweed,
-                                fishLength: _fishLength,
+                              painter: WorldBackgroundPainter(
+                                bgImage: _bgImage!,
+                                world: _world,
                                 camera: _camera,
                                 zoom: _cameraZoom,
-                                world: _world,
                                 screen: _screen,
                               ),
                             ),
-                        ],
+                            if (_fishImage != null)
+                              CustomPaint(
+                                painter: FishGamePainter(
+                                  fishImage: _fishImage!,
+                                  fish: [..._fish, ..._summonedFish],
+                                  player: _player,
+                                  playerLevel: _level,
+                                  playerHeading: _heading,
+                                  playerHidden: _isInSeaweed(_player),
+                                  playerBite: sin(
+                                    (1 -
+                                            (_biteTimer / .24)
+                                                .clamp(0.0, 1.0)) *
+                                        pi,
+                                  ),
+                                  seaweed: _seaweed,
+                                  fishLength: _fishLength,
+                                  camera: _camera,
+                                  zoom: _cameraZoom,
+                                  world: _world,
+                                  screen: _screen,
+                                  powerUps: _powerUps,
+                                  obstacles: _obstacles,
+                                  activeEffects: _activeEffects,
+                                  isBoosting: _isBoosting,
+                                  poisonTrail: _poisonTrail,
+                                  playerSizeMultiplier: _playerSizeMultiplier,
+                                  sonicWaveRadius: _sonicWaveRadius,
+                                  isInvincible: _isInvincible,
+                                  skillL3Active:
+                                      _level == 3 && _skillEffectTimer > 0,
+                                ),
+                              ),
+                          ],
+                        ),
                       ),
                     ),
                   ),
-                ),
-              // 點擊指示器（螢幕空間）
-              if (_tapAlpha > 0 && _tapWorldPos != null)
-                CustomPaint(
-                  painter: TapIndicatorPainter(
-                    worldPos: _tapWorldPos!,
-                    camera: _camera,
-                    zoom: _cameraZoom,
-                    alpha: _tapAlpha,
+                if (_tapAlpha > 0 && _tapWorldPos != null)
+                  CustomPaint(
+                    painter: TapIndicatorPainter(
+                      worldPos: _tapWorldPos!,
+                      camera: _camera,
+                      zoom: _cameraZoom,
+                      alpha: _tapAlpha,
+                    ),
                   ),
-                ),
-              if (_feedbackTimer > 0 && _feedbackText.isNotEmpty)
+                if (_feedbackTimer > 0 && _feedbackText.isNotEmpty)
+                  SafeArea(
+                    child: Align(
+                      alignment: Alignment.topCenter,
+                      child: Padding(
+                        padding: const EdgeInsets.only(top: 92),
+                        child: _FeedbackBadge(text: _feedbackText),
+                      ),
+                    ),
+                  ),
+                if (_useJoystick &&
+                    _joystickOrigin != null &&
+                    _joystickCurrent != null)
+                  CustomPaint(
+                    painter: _JoystickPainter(
+                      origin: _joystickOrigin!,
+                      current: _joystickCurrent!,
+                    ),
+                  ),
+                // HUD
                 SafeArea(
-                  child: Align(
-                    alignment: Alignment.topCenter,
-                    child: Padding(
-                      padding: const EdgeInsets.only(top: 92),
-                      child: _FeedbackBadge(text: _feedbackText),
+                  child: Padding(
+                    padding: const EdgeInsets.all(14),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        _Hud(
+                          level: _level,
+                          hp: _hp,
+                          xp: _xp,
+                          xpGoal: _xpGoal,
+                          boostSize: _playerSizeMultiplier,
+                        ),
+                        const Spacer(),
+                        Row(
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            _MenuButton(onTap: _openPauseMenu),
+                            const Spacer(),
+                            // Active power-up indicators
+                            if (_activeEffects.isNotEmpty)
+                              _ActiveEffectsBar(
+                                effects: _activeEffects,
+                              ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        Row(
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            const Spacer(),
+                            // Skill button
+                            if (SkillDef.hasSkill(_level))
+                              _SkillButton(
+                                skill: SkillDef.forLevel(_level)!,
+                                cooldown: _skillCooldown,
+                                onTap: _useSkill,
+                              ),
+                            const SizedBox(width: 12),
+                            // Boost button
+                            _BoostButton(
+                              isBoosting: _isBoosting,
+                              canBoost:
+                                  _playerSizeMultiplier >
+                                  _initialPlayerSize * .15,
+                              sizePercent: _playerSizeMultiplier,
+                              onPressed: _isBoosting
+                                  ? _stopBoosting
+                                  : _startBoosting,
+                            ),
+                            const SizedBox(width: 8),
+                            Flexible(
+                              child: _ScoreBadge(score: _score),
+                            ),
+                          ],
+                        ),
+                      ],
                     ),
                   ),
                 ),
-              // 搖桿指示器
-              if (_useJoystick &&
-                  _joystickOrigin != null &&
-                  _joystickCurrent != null)
-                CustomPaint(
-                  painter: _JoystickPainter(
-                    origin: _joystickOrigin!,
-                    current: _joystickCurrent!,
+                if (_gameOver)
+                  _GameOverOverlay(
+                    score: _score,
+                    level: _level,
+                    xp: _xp,
+                    xpGoal: _xpGoal,
+                    survivalSeconds: _secondsSurvived,
+                    revengeKills: _revengeKills,
+                    bestCombo: _bestCombo,
+                    bestScore: _bestSavedScore,
+                    onRestart: () => setState(() => _reset(_screen)),
+                    onHome: () => Navigator.of(context).pop(),
                   ),
-                ),
-              // HUD（固定在螢幕上）
-              SafeArea(
-                child: Padding(
-                  padding: const EdgeInsets.all(14),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      _Hud(level: _level, hp: _hp, xp: _xp, xpGoal: _xpGoal),
-                      const Spacer(),
-                      // 底部列：左邊選單按鈕 + 右邊分數
-                      Row(
-                        crossAxisAlignment: CrossAxisAlignment.end,
-                        children: [
-                          _MenuButton(onTap: _openPauseMenu),
-                          const Spacer(),
-                          Flexible(child: _ScoreBadge(score: _score)),
-                        ],
-                      ),
-                    ],
+                if (_isPaused)
+                  _PauseOverlay(
+                    useJoystick: _useJoystick,
+                    onToggleJoystick: () {
+                      setState(() => _useJoystick = !_useJoystick);
+                      SharedPreferences.getInstance().then(
+                        (p) => p.setBool('use_joystick', _useJoystick),
+                      );
+                    },
+                    onResume: () => setState(() => _isPaused = false),
+                    onRestart: () {
+                      setState(() {
+                        _isPaused = false;
+                        _reset(_screen);
+                      });
+                    },
+                    onHome: () => Navigator.of(context).pop(),
                   ),
-                ),
-              ),
-              // Game Over
-              if (_gameOver)
-                _GameOverOverlay(
-                  score: _score,
-                  level: _level,
-                  xp: _xp,
-                  xpGoal: _xpGoal,
-                  survivalSeconds: _secondsSurvived,
-                  revengeKills: _revengeKills,
-                  bestCombo: _bestCombo,
-                  bestScore: _bestSavedScore,
-                  onRestart: () => setState(() => _reset(_screen)),
-                  onHome: () => Navigator.of(context).pop(),
-                ),
-              // 暫停選單
-              if (_isPaused)
-                _PauseOverlay(
-                  useJoystick: _useJoystick,
-                  onToggleJoystick: () {
-                    setState(() => _useJoystick = !_useJoystick);
-                    SharedPreferences.getInstance().then(
-                      (p) => p.setBool('use_joystick', _useJoystick),
-                    );
-                  },
-                  onResume: () => setState(() => _isPaused = false),
-                  onRestart: () {
-                    setState(() {
-                      _isPaused = false;
-                      _reset(_screen);
-                    });
-                  },
-                  onHome: () => Navigator.of(context).pop(),
-                ),
-            ],
-          );
-        },
+              ],
+            );
+          },
+        ),
       ),
     );
   }
@@ -880,7 +1600,6 @@ class _GameScreenState extends State<GameScreen>
       return;
     }
     _isChasing = true;
-    // Set target far away in the direction of the joystick
     final dir = _normalize(delta);
     _targetPosition = _player + dir * 1000;
     _tapWorldPos = _player + dir * 100;
@@ -900,7 +1619,7 @@ class _GameScreenState extends State<GameScreen>
 }
 
 // ═══════════════════════════════════════════════════
-// 世界背景繪製器
+// World background painter
 // ═══════════════════════════════════════════════════
 
 class WorldBackgroundPainter extends CustomPainter {
@@ -947,7 +1666,6 @@ class WorldBackgroundPainter extends CustomPainter {
       Paint()..filterQuality = FilterQuality.high,
     );
 
-    // 暗角漸層（覆蓋世界）
     final gradientPaint = Paint()
       ..shader = RadialGradient(
         center: const Alignment(.05, -.22),
@@ -972,7 +1690,7 @@ class WorldBackgroundPainter extends CustomPainter {
 }
 
 // ═══════════════════════════════════════════════════
-// 點擊指示器
+// Tap indicator
 // ═══════════════════════════════════════════════════
 
 class TapIndicatorPainter extends CustomPainter {
@@ -996,11 +1714,9 @@ class TapIndicatorPainter extends CustomPainter {
       ..style = PaintingStyle.stroke
       ..strokeWidth = 2;
 
-    // 外圈（隨 alpha 縮放）
     final radius = 16 + (1 - alpha) * 14;
     canvas.drawCircle(screenPos, radius, paint);
 
-    // 內圈
     final innerPaint = Paint()
       ..color = Colors.white.withValues(alpha: alpha * .7)
       ..style = PaintingStyle.fill;
@@ -1012,7 +1728,7 @@ class TapIndicatorPainter extends CustomPainter {
 }
 
 // ═══════════════════════════════════════════════════
-// HUD 元件
+// HUD
 // ═══════════════════════════════════════════════════
 
 class _Hud extends StatelessWidget {
@@ -1021,16 +1737,19 @@ class _Hud extends StatelessWidget {
     required this.hp,
     required this.xp,
     required this.xpGoal,
+    required this.boostSize,
   });
 
   final int level;
   final int hp;
   final int xp;
   final int xpGoal;
+  final double boostSize;
 
   @override
   Widget build(BuildContext context) {
     final xpValue = xpGoal == 0 ? 1.0 : (xp / xpGoal).clamp(0.0, 1.0);
+    final sizePercent = (boostSize * 100).round();
     return DecoratedBox(
       decoration: BoxDecoration(
         color: const Color(0xff061821).withValues(alpha: .62),
@@ -1053,6 +1772,19 @@ class _Hud extends StatelessWidget {
                     fontWeight: FontWeight.w900,
                   ),
                 ),
+                if (boostSize < .98) ...[
+                  const SizedBox(width: 8),
+                  Text(
+                    '體 $sizePercent%',
+                    style: TextStyle(
+                      color: boostSize < .3
+                          ? const Color(0xffff3157)
+                          : const Color(0xfff0c040),
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ],
                 const SizedBox(width: 12),
                 Expanded(
                   child: _Bar(value: hp / 100, color: const Color(0xffff3157)),
@@ -1092,6 +1824,217 @@ class _Bar extends StatelessWidget {
         backgroundColor: Colors.white.withValues(alpha: .15),
         valueColor: AlwaysStoppedAnimation<Color>(color),
       ),
+    );
+  }
+}
+
+// ═══════════════════════════════════════════════════
+// Boost button (bottom-right)
+// ═══════════════════════════════════════════════════
+
+class _BoostButton extends StatelessWidget {
+  const _BoostButton({
+    required this.isBoosting,
+    required this.canBoost,
+    required this.sizePercent,
+    required this.onPressed,
+  });
+
+  final bool isBoosting;
+  final bool canBoost;
+  final double sizePercent;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final active = isBoosting && canBoost;
+    return GestureDetector(
+      onTapDown: (_) => onPressed(),
+      onTapUp: (_) {
+        if (isBoosting) onPressed();
+      },
+      child: Container(
+        width: 52,
+        height: 52,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          color: (active
+                  ? const Color(0xff00bcd4)
+                  : const Color(0xff1a3540))
+              .withValues(alpha: .72),
+          border: Border.all(
+            color: active
+                ? const Color(0xff4dd0e1)
+                : Colors.white.withValues(alpha: .2),
+            width: 2,
+          ),
+          boxShadow: active
+              ? [
+                  BoxShadow(
+                    color: const Color(0xff00bcd4).withValues(alpha: .4),
+                    blurRadius: 12,
+                  ),
+                ]
+              : null,
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Text(
+              '⚡',
+              style: TextStyle(
+                fontSize: 18,
+                color: canBoost ? Colors.white : Colors.white38,
+              ),
+            ),
+            Text(
+              '${(sizePercent * 100).round()}%',
+              style: TextStyle(
+                fontSize: 9,
+                color: canBoost ? Colors.white70 : Colors.white24,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ═══════════════════════════════════════════════════
+// Skill button (bottom-right)
+// ═══════════════════════════════════════════════════
+
+class _SkillButton extends StatelessWidget {
+  const _SkillButton({
+    required this.skill,
+    required this.cooldown,
+    required this.onTap,
+  });
+
+  final SkillDef skill;
+  final double cooldown;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final ready = cooldown <= 0;
+    final progress = ready
+        ? 1.0
+        : 1.0 - (cooldown / skill.cooldown).clamp(0.0, 1.0);
+    return GestureDetector(
+      onTap: ready ? onTap : null,
+      child: SizedBox(
+        width: 52,
+        height: 52,
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            SizedBox(
+              width: 48,
+              height: 48,
+              child: CircularProgressIndicator(
+                value: progress,
+                strokeWidth: 3,
+                backgroundColor: Colors.white.withValues(alpha: .08),
+                valueColor: AlwaysStoppedAnimation<Color>(
+                  ready
+                      ? const Color(0xfff0c040)
+                      : Colors.white.withValues(alpha: .25),
+                ),
+              ),
+            ),
+            Text(
+              skill.name.substring(0, 2),
+              style: TextStyle(
+                color: ready ? Colors.white : Colors.white38,
+                fontSize: 13,
+                fontWeight: FontWeight.w900,
+              ),
+            ),
+            if (!ready)
+              Positioned(
+                bottom: 6,
+                child: Text(
+                  '${cooldown.ceil()}s',
+                  style: const TextStyle(
+                    color: Colors.white38,
+                    fontSize: 9,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ═══════════════════════════════════════════════════
+// Active effects bar
+// ═══════════════════════════════════════════════════
+
+class _ActiveEffectsBar extends StatelessWidget {
+  const _ActiveEffectsBar({required this.effects});
+  final List<ActiveEffect> effects;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: effects.map((e) {
+        String icon;
+        Color color;
+        switch (e.type) {
+          case PowerUpType.boost:
+            icon = '⚡';
+            color = const Color(0xff00bcd4);
+            break;
+          case PowerUpType.magnet:
+            icon = '🧲';
+            color = const Color(0xff9c27b0);
+            break;
+          case PowerUpType.shield:
+            icon = '🛡';
+            color = const Color(0xff2196f3);
+            break;
+          case PowerUpType.poison:
+            icon = '💀';
+            color = const Color(0xff4caf50);
+            break;
+          case PowerUpType.doubleScore:
+            icon = '✨';
+            color = const Color(0xffffc107);
+            break;
+          case PowerUpType.vortex:
+            icon = '🌪';
+            color = const Color(0xff607d8b);
+            break;
+          case PowerUpType.star:
+            icon = '💎';
+            color = const Color(0xffff4081);
+            break;
+        }
+        return Padding(
+          padding: const EdgeInsets.only(right: 6),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(icon, style: const TextStyle(fontSize: 16)),
+              Text(
+                '${e.remaining.ceil()}s',
+                style: TextStyle(
+                  color: color,
+                  fontSize: 9,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ],
+          ),
+        );
+      }).toList(),
     );
   }
 }
