@@ -1,0 +1,38 @@
+# App Store Connect API keys (sensitive)
+ios/fastlane/*.p8
+
+# Upload scripts with embedded credentials
+scripts/upload_testflight.sh
+
+# Flutter
+build/
+.dart_tool/
+.packages
+.flutter-plugins
+.flutter-plugins-dependencies
+*.iml
+.idea/
+.vscode/
+*.lock
+
+# iOS
+ios/Pods/
+ios/.symlinks/
+ios/Flutter/Flutter.framework
+ios/Flutter/Flutter.podspec
+*.xcworkspace
+ios/Runner.xcworkspace/
+
+# macOS
+macos/Pods/
+macos/.symlinks/
+
+# Android
+android/.gradle/
+android/app/build/
+android/local.properties
+
+# Misc
+.DS_Store
+*.swp
+*.swo
