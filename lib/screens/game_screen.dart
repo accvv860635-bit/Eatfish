@@ -14,7 +14,7 @@ import '../models/game_record.dart';
 import '../models/obstacle.dart';
 import '../models/power_up.dart';
 import '../models/seaweed_patch.dart';
-import '../models/skill_def.dart';
+import '../models/skill_def.dart' show SkillGroup;
 import '../painters/fish_game_painter.dart';
 import '../services/storage_service.dart';
 
@@ -38,7 +38,6 @@ class _GameScreenState extends State<GameScreen>
     with SingleTickerProviderStateMixin {
   static const int maxLevel = FishSpecs.maxLevel;
   static const double worldWidthScale = 12.0;
-  static const double worldHeightScale = 1.8;
   static const double _boostSpeedMult = 2.0;
   static const double _boostSizeDrain = 0.05;
   static const int _maxPowerUpsOnMap = 3;
@@ -53,6 +52,9 @@ class _GameScreenState extends State<GameScreen>
 
   ui.Image? _fishImage;
   ui.Image? _bgImage;
+  ui.Image? _lv16Image;
+  ui.Image? _lv17Image;
+  ui.Image? _lv18Image;
 
   Size _screen = Size.zero;
   Size _world = Size.zero;
@@ -77,6 +79,10 @@ class _GameScreenState extends State<GameScreen>
   double _runTime = 0;
   double _comboTimer = 0;
   double _feedbackTimer = 0;
+  double _screenShake = 0; // screen shake intensity for combo break
+
+  // ─── Floating damage/heal numbers ───
+  final List<_FloatingNumber> _floatingNumbers = [];
   double _spawnGraceTimer = 0;
   double _biteTimer = 0;
   bool _gameOver = false;
@@ -89,21 +95,30 @@ class _GameScreenState extends State<GameScreen>
   Offset? _joystickCurrent;
   String _feedbackText = '';
 
-  // ─── Boost ───
+  // ─── Boost (skill-like, fixed duration) ───
   bool _isBoosting = false;
+  double _boostCooldown = 0;
+  static const double _boostDuration = 3.0;
+  static const double _boostCooldownTime = 6.0;
   double _playerSizeMultiplier = 1.0;
-  double _initialPlayerSize = 0;
+  double _boostTimer = 0; // remaining boost time
+  double _hitInvincibility = 0; // invincibility after hit
+  double _levelUpFlash = 0; // flash timer for level-up
 
   // ─── Power-ups ───
   double _powerUpSpawnTimer = 0;
 
-  // ─── Skills ───
-  double _skillCooldown = 0;
+  // ─── Skills (5 groups, independent cooldowns) ───
+  final List<double> _skillCooldowns = [0, 0, 0, 0, 0];
   double _skillEffectTimer = 0;
+  int _activeSkillGroup = -1; // which group's effect is currently active
   int _skillEatCount = 0;
   final List<FishEntity> _summonedFish = [];
   double _summonTimer = 0;
   double _sonicWaveRadius = 0;
+  // ─── Berserk mode (Group 4) ───
+  double _berserkSpeedMult = 1.0;
+  double _berserkEatMult = 1.0;
 
   // ─── Obstacles ───
   double _hookTimer = 0;
@@ -114,17 +129,36 @@ class _GameScreenState extends State<GameScreen>
   final List<Offset> _poisonTrail = [];
   static const double _poisonTrailRadius = 60;
 
-  int get _xpGoal => _level >= maxLevel ? 0 : 28 + (_level * 16);
+  int get _xpGoal => _level >= maxLevel ? 0 : (_level * _level * 3 + 30);
+  // Later levels: fewer total fish but they're more dangerous
+  int get _effectiveFishCount =>
+      (_fishCount * (1.0 - (_level - 1) * .04)).clamp(8, _fishCount).round();
   int get _secondsSurvived => _runTime.floor();
-  double get _cameraZoom => (1.0 - (_level - 1) * .022).clamp(.62, 1.0);
+  int get _maxHp => 60 + _level * 15;
+  double get _cameraZoom {
+    // More aggressive zoom-out at high levels.
+    final basedOnLevel = (1.0 - (_level - 1) * .055).clamp(.18, 1.0);
+    // In landscape (wide screen), zoom out proportionally
+    if (_screen.width > _screen.height) {
+      return (basedOnLevel * _screen.height / _screen.width).clamp(
+        0.15,
+        basedOnLevel,
+      );
+    }
+    return basedOnLevel;
+  }
+
   Size get _visibleWorldSize =>
       Size(_screen.width / _cameraZoom, _screen.height / _cameraZoom);
 
   bool get _isInvincible =>
-      _activeEffects.any((e) =>
-          e.type == PowerUpType.shield ||
-          e.type == PowerUpType.star) ||
-      (_skillEffectTimer > 0 && _level == 1);
+      _activeEffects.any(
+        (e) => e.type == PowerUpType.shield || e.type == PowerUpType.star,
+      ) ||
+      // Group 0 tier 0: dash through enemies
+      (_skillEffectTimer > 0 && _activeSkillGroup == 0) ||
+      // Group 4 tier 1+: berserk invincibility
+      (_skillEffectTimer > 0 && _activeSkillGroup == 4 && _level >= 14);
 
   @override
   void initState() {
@@ -134,7 +168,12 @@ class _GameScreenState extends State<GameScreen>
     _loadPrefs();
     _ticker = createTicker(_tick)..start();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-    SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.portraitUp,
+      DeviceOrientation.portraitDown,
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
     HardwareKeyboard.instance.addHandler(_onKeyEvent);
   }
 
@@ -147,7 +186,7 @@ class _GameScreenState extends State<GameScreen>
       }
       if (event.logicalKey == LogicalKeyboardKey.keyQ ||
           event.logicalKey == LogicalKeyboardKey.keyE) {
-        _useSkill();
+        _useSkill(0);
         return true;
       }
     }
@@ -161,12 +200,15 @@ class _GameScreenState extends State<GameScreen>
   }
 
   void _startBoosting() {
-    if (_playerSizeMultiplier <= _initialPlayerSize * .15) return;
+    if (_boostCooldown > 0 || _isBoosting) return;
     _isBoosting = true;
+    _boostTimer = _boostDuration;
+    HapticFeedback.mediumImpact();
   }
 
   void _stopBoosting() {
     _isBoosting = false;
+    _boostCooldown = _boostCooldownTime;
   }
 
   Future<void> _loadPrefs() async {
@@ -185,16 +227,38 @@ class _GameScreenState extends State<GameScreen>
     final bgData = await rootBundle.load(
       (widget.gameMap ?? GameMaps.all.first).assetPath,
     );
+    final lv16Data = await rootBundle.load(
+      'assets/images/lv16_megamouth_shark.png',
+    );
+    final lv17Data = await rootBundle.load(
+      'assets/images/lv17_dunkleosteus.png',
+    );
+    final lv18Data = await rootBundle.load('assets/images/lv18_mosasaurus.png');
     final fishCodec = await ui.instantiateImageCodec(
       fishData.buffer.asUint8List(),
     );
     final bgCodec = await ui.instantiateImageCodec(bgData.buffer.asUint8List());
+    final lv16Codec = await ui.instantiateImageCodec(
+      lv16Data.buffer.asUint8List(),
+    );
+    final lv17Codec = await ui.instantiateImageCodec(
+      lv17Data.buffer.asUint8List(),
+    );
+    final lv18Codec = await ui.instantiateImageCodec(
+      lv18Data.buffer.asUint8List(),
+    );
     final fishFrame = await fishCodec.getNextFrame();
     final bgFrame = await bgCodec.getNextFrame();
+    final lv16Frame = await lv16Codec.getNextFrame();
+    final lv17Frame = await lv17Codec.getNextFrame();
+    final lv18Frame = await lv18Codec.getNextFrame();
     if (mounted) {
       setState(() {
         _fishImage = fishFrame.image;
         _bgImage = bgFrame.image;
+        _lv16Image = lv16Frame.image;
+        _lv17Image = lv17Frame.image;
+        _lv18Image = lv18Frame.image;
       });
     }
   }
@@ -219,7 +283,7 @@ class _GameScreenState extends State<GameScreen>
       Offset(_player.dx - _screen.width / 2, _player.dy - _screen.height / 2),
     );
     _xp = 0;
-    _hp = 100;
+    _hp = _maxHp;
     _score = 0;
     _combo = 0;
     _bestCombo = 0;
@@ -238,15 +302,17 @@ class _GameScreenState extends State<GameScreen>
     _tapWorldPos = null;
 
     _isBoosting = false;
+    _boostCooldown = 0;
+    _boostTimer = 0;
     _playerSizeMultiplier = 1.0;
-    _initialPlayerSize = _fishLength(1);
 
     _powerUps.clear();
     _activeEffects.clear();
     _powerUpSpawnTimer = _random.nextDouble() * 5 + 15;
 
-    _skillCooldown = 0;
+    _skillCooldowns.setAll(0, [0, 0, 0, 0, 0]);
     _skillEffectTimer = 0;
+    _activeSkillGroup = -1;
     _skillEatCount = 0;
     _summonedFish.clear();
     _summonTimer = 0;
@@ -283,9 +349,13 @@ class _GameScreenState extends State<GameScreen>
   }
 
   Size _worldSizeFor(Size screenSize) {
+    // Keep world aspect ratio roughly constant (~3:1) regardless of orientation.
+    // In landscape the screen is wider, so we scale height up to compensate.
+    final aspectRatio = screenSize.width / screenSize.height;
+    final heightScale = (1.8 * aspectRatio / 0.5).clamp(1.8, 4.5);
     return Size(
       screenSize.width * worldWidthScale,
-      screenSize.height * worldHeightScale,
+      screenSize.height * heightScale,
     );
   }
 
@@ -393,20 +463,26 @@ class _GameScreenState extends State<GameScreen>
   }
 
   int _randomSpawnLevel() {
-    final minLevel = max(1, _level - 5);
+    final minLevel = max(1, _level - 4);
     final maxSpawnLevel = min(maxLevel, _level + 5);
     final bossAlive = _fish.any((fish) => fish.level >= 18);
     final roll = _random.nextDouble();
-    if (_level >= 13 && !bossAlive && roll > .985) {
+
+    // High levels: more predator bias
+    final predatorBoost = max(0.0, (_level - 8) * .03); // 0→0.3 from Lv.8→18
+
+    if (_level >= 13 && !bossAlive && roll > .985 - predatorBoost) {
       return 18;
     }
-    if (_level >= 11 && roll > .965) {
+    if (_level >= 11 && roll > .965 - predatorBoost) {
       return min(maxSpawnLevel, 17);
     }
-    if (_level >= 9 && roll > .94) {
+    if (_level >= 9 && roll > .94 - predatorBoost) {
       return min(maxSpawnLevel, 16);
     }
-    if (roll < .52) {
+    // At high levels, fewer small fish
+    final smallFishChance = .52 - predatorBoost;
+    if (roll < smallFishChance) {
       return minLevel + _random.nextInt(_level - minLevel + 1);
     }
     if (roll < .88) {
@@ -435,6 +511,8 @@ class _GameScreenState extends State<GameScreen>
 
     _updatePlayer(dt);
     _updateBoost(dt);
+    _hitInvincibility = max(0, _hitInvincibility - dt);
+    _levelUpFlash = max(0, _levelUpFlash - dt);
     _updateCamera(dt);
     _updateFish(dt);
     _resolveCollisions();
@@ -450,10 +528,23 @@ class _GameScreenState extends State<GameScreen>
     _runTime += dt;
     _biteTimer = max(0, _biteTimer - dt);
     _comboTimer = max(0, _comboTimer - dt);
-    if (_comboTimer == 0) {
+    if (_comboTimer == 0 && _combo > 2) {
+      // Combo broken with impact
+      _screenShake = 14;
+      _spawnFloatingText('連擊中斷', const Color(0xffff5a6e), 1.6);
+      _combo = 0;
+      HapticFeedback.heavyImpact();
+    } else if (_comboTimer == 0) {
       _combo = 0;
     }
     _feedbackTimer = max(0, _feedbackTimer - dt);
+    // Update floating numbers
+    for (var i = _floatingNumbers.length - 1; i >= 0; i--) {
+      _floatingNumbers[i].update(dt);
+      if (_floatingNumbers[i].isDead) _floatingNumbers.removeAt(i);
+    }
+    // Decay screen shake
+    _screenShake = max(0, _screenShake - dt * 40);
     setState(() {});
   }
 
@@ -485,9 +576,11 @@ class _GameScreenState extends State<GameScreen>
 
     final speed = _playerSpeedForLevel(_level);
     final boostMult = _isBoosting ? _boostSpeedMult : 1.0;
-    final effectSpeedMult = 1.0 +
-        (_activeEffects.any((e) => e.type == PowerUpType.boost) ? .6 : 0);
-    _player += _heading * speed * boostMult * effectSpeedMult * dt;
+    final berserkMult = _berserkSpeedMult;
+    final effectSpeedMult =
+        1.0 + (_activeEffects.any((e) => e.type == PowerUpType.boost) ? .6 : 0);
+    _player +=
+        _heading * speed * boostMult * berserkMult * effectSpeedMult * dt;
 
     final playerLength = _fishLength(_level);
     final xMargin = max(22.0, playerLength * .42);
@@ -511,20 +604,25 @@ class _GameScreenState extends State<GameScreen>
   // ─── Boost ───
 
   void _updateBoost(double dt) {
-    final canBoost =
-        _playerSizeMultiplier > _initialPlayerSize * .15;
-    if (_isBoosting && canBoost) {
-      _playerSizeMultiplier = max(
-        _initialPlayerSize * .15,
-        _playerSizeMultiplier - _boostSizeDrain * dt,
-      );
-    } else if (!_isBoosting) {
+    // Count down boost timer
+    if (_isBoosting) {
+      _boostTimer = max(0, _boostTimer - dt);
+      if (_boostTimer <= 0) {
+        _stopBoosting();
+      }
+    }
+    // Count down boost cooldown
+    _boostCooldown = max(0, _boostCooldown - dt);
+
+    // Size multiplier recovery (only for inflate skill, not boost)
+    if (!_isBoosting) {
+      final clampMax = (_activeSkillGroup == 0 && _skillEffectTimer > 0)
+          ? 3.0
+          : 1.0;
       _playerSizeMultiplier = min(
-        1.0,
+        clampMax,
         _playerSizeMultiplier + _boostSizeDrain * .5 * dt,
       );
-    } else {
-      _isBoosting = false;
     }
   }
 
@@ -538,6 +636,13 @@ class _GameScreenState extends State<GameScreen>
     );
     final target = _clampCamera(desired);
     _camera = Offset.lerp(_camera, target, min(1, dt * 3.5))!;
+    // Screen shake offset (combo break, etc.)
+    if (_screenShake > 0.3) {
+      _camera += Offset(
+        (sin(_runTime * 48 + 1.3) * _screenShake),
+        (cos(_runTime * 56 + 2.1) * _screenShake * .7),
+      );
+    }
   }
 
   // ─── Tap indicator ───
@@ -552,6 +657,16 @@ class _GameScreenState extends State<GameScreen>
 
   void _updateFish(double dt) {
     const margin = 160.0;
+    // Count active chasers this frame
+    final activeChasers = _fish
+        .where(
+          (f) =>
+              f.behaviorState == FishBehaviorState.chase ||
+              f.behaviorState == FishBehaviorState.warn ||
+              f.behaviorState == FishBehaviorState.attack ||
+              f.biteProgress > 0,
+        )
+        .length;
     final playerHidden = _isInSeaweed(_player);
     final playerNoise = _isChasing ? 1.0 : .58;
     final allFish = [..._fish, ..._summonedFish];
@@ -600,6 +715,21 @@ class _GameScreenState extends State<GameScreen>
           fish.position += pull * slowMult;
         }
       }
+      // Group 2: Vortex pull (all fish)
+      if (_activeSkillGroup == 2 && _skillEffectTimer > 0) {
+        final tier = SkillGroup.byIndex(2)!.tierAt(_level);
+        final pullRange = 220.0 + tier * 60;
+        final dist = (fish.position - _player).distance;
+        if (dist < pullRange && dist > 25) {
+          final pull =
+              _normalize(_player - fish.position) * (160 + tier * 40) * dt;
+          fish.position += pull * slowMult;
+          if (tier >= 1) {
+            // Also slow pulled fish
+            slowMult = min(slowMult, 0.3);
+          }
+        }
+      }
 
       if (fish.stunnedTimer > 0) {
         fish.behaviorState = FishBehaviorState.stunned;
@@ -629,9 +759,10 @@ class _GameScreenState extends State<GameScreen>
 
       final canChase =
           fish.predator &&
-          fish.level > _level &&
+          fish.level >= _level &&
           distance < chaseRange &&
-          fish.restTimer <= 0;
+          fish.restTimer <= 0 &&
+          activeChasers < 3; // max 3 simultaneous chasers
 
       if (canChase &&
           distance < attackRange &&
@@ -647,8 +778,8 @@ class _GameScreenState extends State<GameScreen>
       } else {
         if (fish.chaseTimer <= 0) {
           fish.behaviorState = FishBehaviorState.rest;
-          fish.restTimer = 1.4 + _random.nextDouble() * 2.8;
-          fish.chaseTimer = 1.2 + _random.nextDouble() * 2.4;
+          fish.restTimer = 3.0 + _random.nextDouble() * 4.0;
+          fish.chaseTimer = 0; // don't chase again until rest+wander completes
         }
         if (fish.wanderTimer <= 0) {
           fish.behaviorState = fish.restTimer > 0
@@ -659,6 +790,10 @@ class _GameScreenState extends State<GameScreen>
               (_random.nextDouble() - .5) * 1.6;
           desired = Offset(cos(angle), sin(angle)) * _cruiseSpeedForFish(fish);
           fish.wanderTimer = .6 + _random.nextDouble() * 2.1;
+          // After rest+wander, predators can chase again
+          if (fish.predator && fish.chaseTimer <= 0 && fish.restTimer <= 0) {
+            fish.chaseTimer = 1.0 + _random.nextDouble() * 2.0;
+          }
         }
       }
 
@@ -696,7 +831,67 @@ class _GameScreenState extends State<GameScreen>
           fish.position.dy < -margin ||
           fish.position.dy > _world.height + margin) {
         if (i < _fish.length) {
-          _fish[i] = _spawnFish(awayFromPlayer: _player);
+          if (_fish.length > _effectiveFishCount) {
+            _fish.removeAt(i);
+          } else {
+            _fish[i] = _spawnFish(awayFromPlayer: _player);
+          }
+        }
+      }
+    }
+
+    // ─── Fish schooling: same-level fish cluster together ───
+    _applySchooling(dt);
+  }
+
+  void _applySchooling(double dt) {
+    if (_fish.length < 3) return;
+    const schoolRadius = 260.0;
+    const schoolForce = 18.0;
+
+    for (var i = 0; i < _fish.length; i++) {
+      final fish = _fish[i];
+      // Only apply to wandering/resting fish, not chasing/fleeing
+      final state = fish.behaviorState;
+      if (state == FishBehaviorState.chase ||
+          state == FishBehaviorState.flee ||
+          state == FishBehaviorState.attack ||
+          state == FishBehaviorState.stunned ||
+          state == FishBehaviorState.hide) {
+        continue;
+      }
+
+      var centerX = 0.0, centerY = 0.0, count = 0;
+
+      // Sample approach: check a subset of same-level fish
+      for (var j = 0; j < _fish.length; j++) {
+        if (i == j) continue;
+        final other = _fish[j];
+        if (other.level != fish.level) continue;
+        // Only cluster with similarly-behaving fish
+        final otherState = other.behaviorState;
+        if (otherState == FishBehaviorState.chase ||
+            otherState == FishBehaviorState.flee ||
+            otherState == FishBehaviorState.attack) {
+          continue;
+        }
+
+        final dist = (fish.position - other.position).distance;
+        if (dist < schoolRadius) {
+          centerX += other.position.dx;
+          centerY += other.position.dy;
+          count++;
+        }
+      }
+
+      if (count >= 1) {
+        final center = Offset(centerX / count, centerY / count);
+        final toCenter = center - fish.position;
+        final dist = toCenter.distance;
+        if (dist > 12) {
+          // Gentle attraction toward school center; stronger when farther
+          final strength = (dist / schoolRadius).clamp(0.1, 1.0) * schoolForce;
+          fish.position += _normalize(toCenter) * strength * dt;
         }
       }
     }
@@ -705,12 +900,14 @@ class _GameScreenState extends State<GameScreen>
   // ─── Collisions ───
 
   void _resolveCollisions() {
-    final playerRadius = _fishLength(_level) * .28 *
-        _playerSizeMultiplier;
+    final playerRadius = _fishLength(_level) * .28 * _playerSizeMultiplier;
     final starActive = _activeEffects.any((e) => e.type == PowerUpType.star);
-    final skillL3Active = _level == 3 && _skillEffectTimer > 0;
-    var eatRangeMultiplier = 1.0;
-    if (_level == 4 && _skillEffectTimer > 0) eatRangeMultiplier = 1.5;
+    final skillL3Active = _activeSkillGroup == 0 && _skillEffectTimer > 0;
+    var eatRangeMultiplier = _berserkEatMult;
+    if (_activeSkillGroup == 1 && _skillEffectTimer > 0) {
+      final tier = SkillGroup.byIndex(1)!.tierAt(_level);
+      eatRangeMultiplier = tier >= 2 ? 1.8 : 1.5;
+    }
 
     for (var i = 0; i < _fish.length; i++) {
       final fish = _fish[i];
@@ -739,34 +936,54 @@ class _GameScreenState extends State<GameScreen>
         final comboBonus = _combo >= 3 ? (_combo - 2) * 20 : 0;
         final doubleMult =
             _activeEffects.any((e) => e.type == PowerUpType.doubleScore)
-                ? 2
-                : 1;
+            ? 2
+            : 1;
         _score +=
             (spec.score + comboBonus + (revengeBonus ? spec.score : 0)) *
-                doubleMult;
+            doubleMult;
         _xp += spec.xp + (revengeBonus ? spec.xp ~/ 2 : 0);
+        final hpRestore = 5 + spec.damage ~/ 3;
+        _hp = min(_maxHp, _hp + hpRestore); // small HP restore
+        if (_hp < _maxHp && hpRestore > 0) {
+          _spawnFloatingText('+$hpRestore ❤️', const Color(0xff3ee6d4), 1.0);
+        }
+        if (_combo >= 5) {
+          _spawnFloatingText('x$_combo', const Color(0xfff0c040), 1.3);
+          HapticFeedback.heavyImpact();
+        } else if (_combo >= 3) {
+          _spawnFloatingText('x$_combo', const Color(0xfff0c040), 1.0);
+          HapticFeedback.mediumImpact();
+        } else {
+          HapticFeedback.lightImpact();
+        }
         if (revengeBonus) {
           _revengeKills += 1;
-          _showFeedback('反殺 +${spec.score * doubleMult}');
+          _spawnFloatingText('反殺!', const Color(0xffff5a6e), 1.4);
         } else if (starActive) {
-          _showFeedback('⭐ +${spec.score * doubleMult}');
-        } else if (_combo >= 3) {
-          _showFeedback('連吃 $_combo');
-        }
-
-        // Skill L4: reduce cooldown per eat
-        if (_level == 4 && _skillEffectTimer > 0) {
-          _skillCooldown = max(0, _skillCooldown - .5);
-          _skillEatCount++;
-          _showFeedback('狂咬 x$_skillEatCount');
+          _spawnFloatingText('⭐ +${spec.score * doubleMult}', const Color(0xffffd740), 1.2);
         }
 
         _biteTimer = .24;
-        _fish[i] = _spawnFish(awayFromPlayer: _player);
+        if (_fish.length > _effectiveFishCount) {
+          _fish.removeAt(i);
+        } else {
+          _fish[i] = _spawnFish(awayFromPlayer: _player);
+        }
         while (_level < maxLevel && _xp >= _xpGoal) {
           _xp -= _xpGoal;
           _level += 1;
-          _showFeedback('升級 Lv.$_level');
+          _levelUpFlash = .5;
+          _spawnFloatingText('Lv.$_level！', const Color(0xff3ee6d4), 2.0);
+          HapticFeedback.heavyImpact();
+        }
+
+        // Blood rage: CD reduction per eat (Group 1)
+        if (_activeSkillGroup == 1 && _skillEffectTimer > 0) {
+          final tier = SkillGroup.byIndex(1)!.tierAt(_level);
+          final reduction = tier >= 2 ? 0.8 : 0.5;
+          _skillCooldowns[1] = max(0, _skillCooldowns[1] - reduction);
+          _skillEatCount++;
+          _showFeedback('狂咬 x$_skillEatCount');
         }
       } else if (_spawnGraceTimer <= 0) {
         if (_isInvincible) {
@@ -802,11 +1019,22 @@ class _GameScreenState extends State<GameScreen>
         final spec = FishSpecs.byLevel(fish.level);
         final hidingReduction = _isInSeaweed(_player) ? .55 : 1.0;
         final damage = (spec.damage * hidingReduction).round();
+
+        // Invincibility frames after hit
+        if (_hitInvincibility > 0) {
+          // Still knock back but no damage
+          _player -= _heading * 20;
+          continue;
+        }
+        _hitInvincibility = 1.5;
+
         _hp = max(0, _hp - damage);
+        _spawnFloatingText('-$damage', const Color(0xffff5a6e), 1.2);
+        HapticFeedback.heavyImpact();
         fish.biteProgress = 0;
         fish.restTimer = max(fish.restTimer, 1.1);
         fish.behaviorState = FishBehaviorState.rest;
-        _player -= _heading * 28;
+        _player -= _heading * 40; // stronger knockback
         final playerLength = _fishLength(_level);
         _player = Offset(
           _player.dx.clamp(
@@ -821,6 +1049,7 @@ class _GameScreenState extends State<GameScreen>
         if (_hp <= 0) {
           _gameOver = true;
           _showFeedback('');
+          HapticFeedback.heavyImpact();
         }
       }
     }
@@ -831,7 +1060,8 @@ class _GameScreenState extends State<GameScreen>
     // Collision with summoned fish (skill L2)
     for (var i = 0; i < _summonedFish.length; i++) {
       final fish = _summonedFish[i];
-      final radius = _fishLength(fish.level, fish.sizeScale) *
+      final radius =
+          _fishLength(fish.level, fish.sizeScale) *
           ui.lerpDouble(.22, .31, fish.depth)!;
       if ((_player - fish.position).distance > playerRadius + radius) continue;
       final spec = FishSpecs.byLevel(fish.level);
@@ -840,9 +1070,7 @@ class _GameScreenState extends State<GameScreen>
       _comboTimer = 2.4;
       final comboBonus = _combo >= 3 ? (_combo - 2) * 20 : 0;
       final doubleMult =
-          _activeEffects.any((e) => e.type == PowerUpType.doubleScore)
-              ? 2
-              : 1;
+          _activeEffects.any((e) => e.type == PowerUpType.doubleScore) ? 2 : 1;
       _score += (spec.score + comboBonus) * doubleMult;
       _xp += spec.xp;
       _biteTimer = .24;
@@ -851,7 +1079,9 @@ class _GameScreenState extends State<GameScreen>
       while (_level < maxLevel && _xp >= _xpGoal) {
         _xp -= _xpGoal;
         _level += 1;
-        _showFeedback('升級 Lv.$_level');
+        _levelUpFlash = .5;
+        _spawnFloatingText('Lv.$_level！', const Color(0xff3ee6d4), 2.0);
+        HapticFeedback.heavyImpact();
       }
     }
   }
@@ -881,8 +1111,12 @@ class _GameScreenState extends State<GameScreen>
         if (smaller.level < 2) continue;
         if (bigger.restTimer > 0) continue;
 
-        // Smaller fish gets eaten/killed by bigger — respawn it
-        _fish[smallerIdx] = _spawnFish(awayFromPlayer: smaller.position);
+        // Smaller fish gets eaten — reduce count at high levels
+        if (_fish.length > _effectiveFishCount) {
+          _fish.removeAt(smallerIdx);
+        } else {
+          _fish[smallerIdx] = _spawnFish(awayFromPlayer: smaller.position);
+        }
         bigger.restTimer = max(bigger.restTimer, .6);
         bigger.behaviorState = FishBehaviorState.rest;
         // Break inner loop since fish array was modified
@@ -894,6 +1128,17 @@ class _GameScreenState extends State<GameScreen>
   void _showFeedback(String text) {
     _feedbackText = text;
     _feedbackTimer = text.isEmpty ? 0 : 1.2;
+  }
+
+  void _spawnFloatingText(String text, Color color, [double lifetime = 1.0]) {
+    // Convert player world position to screen position
+    final screenPos = (_player - _camera) * _cameraZoom;
+    _floatingNumbers.add(_FloatingNumber(
+      position: screenPos,
+      text: text,
+      color: color,
+      lifetime: lifetime,
+    ));
   }
 
   bool _isPlayerBitingTail(FishEntity fish) {
@@ -921,7 +1166,8 @@ class _GameScreenState extends State<GameScreen>
     return minSpeed + _random.nextDouble() * (maxSpeed - minSpeed);
   }
 
-  double _playerSpeedForLevel(int level) => _baseSpeedForLevel(level) + 18;
+  double _playerSpeedForLevel(int level) =>
+      _baseSpeedForLevel(level) + max(4, 22 - level);
 
   double _cruiseSpeedForFish(FishEntity fish) =>
       _baseSpeedForLevel(fish.level) * fish.speedScale;
@@ -983,7 +1229,8 @@ class _GameScreenState extends State<GameScreen>
   void _resolvePowerUpCollisions() {
     for (var i = _powerUps.length - 1; i >= 0; i--) {
       final pu = _powerUps[i];
-      if ((_player - pu.position).distance < pu.radius + _fishLength(_level) * .35) {
+      if ((_player - pu.position).distance <
+          pu.radius + _fishLength(_level) * .35) {
         _applyPowerUpEffect(pu.type);
         _powerUps.removeAt(i);
       }
@@ -1018,7 +1265,8 @@ class _GameScreenState extends State<GameScreen>
     // Remove existing effect of same type
     _activeEffects.removeWhere((e) => e.type == type);
     _activeEffects.add(ActiveEffect(type: type, remaining: duration));
-    _showFeedback('${puLabel(type)}!');
+    _spawnFloatingText('${puLabel(type)}!', const Color(0xfff0c040), 1.3);
+    HapticFeedback.mediumImpact();
   }
 
   String puLabel(PowerUpType type) {
@@ -1067,80 +1315,154 @@ class _GameScreenState extends State<GameScreen>
   // ─── Skills ───
 
   void _updateSkillCooldown(double dt) {
-    _skillCooldown = max(0, _skillCooldown - dt);
+    for (var i = 0; i < _skillCooldowns.length; i++) {
+      _skillCooldowns[i] = max(0, _skillCooldowns[i] - dt);
+    }
     _skillEffectTimer = max(0, _skillEffectTimer - dt);
     _summonTimer = max(0, _summonTimer - dt);
 
-    // Sonic wave expansion
-    if (_level == 5 && _skillEffectTimer > 0) {
-      final elapsed = SkillDef.forLevel(5)!.cooldown - _skillCooldown;
-      _sonicWaveRadius = 40 + elapsed * 400;
+    // Sonic wave (Group 1 tier 1): expand 0.3s, then sustain at max radius
+    if (_activeSkillGroup == 1 && _skillEffectTimer > 0 && _level >= 5) {
+      final elapsed = 3.0 - _skillEffectTimer;
+      _sonicWaveRadius = (40 + (elapsed / .3) * 240).clamp(40.0, 280.0);
     } else {
       _sonicWaveRadius = 0;
     }
 
-    // Summon despawn
+    // Summon despawn (Group 0 tier 1)
     if (_summonTimer <= 0 && _summonedFish.isNotEmpty) {
       _summonedFish.clear();
     }
 
-    // Skill L3 inflate
-    if (_level == 3 && _skillEffectTimer <= 0 && _playerSizeMultiplier > 1.0) {
+    // Inflate cleanup (Group 0 tier 2)
+    if (_activeSkillGroup == 0 &&
+        _skillEffectTimer <= 0 &&
+        _playerSizeMultiplier > 1.0) {
       _playerSizeMultiplier = 1.0;
+    }
+
+    // Berserk cleanup (Group 4)
+    if (_activeSkillGroup == 4 && _skillEffectTimer <= 0) {
+      _berserkSpeedMult = 1.0;
+      _berserkEatMult = 1.0;
     }
   }
 
-  void _useSkill() {
-    if (_skillCooldown > 0) return;
-    final skill = SkillDef.forLevel(_level);
-    if (skill == null) return;
+  void _useSkill(int groupIndex) {
+    if (groupIndex < 0 || groupIndex >= 5) return;
+    if (_skillCooldowns[groupIndex] > 0) return;
+    final group = SkillGroup.byIndex(groupIndex);
+    if (group == null || !group.isUnlocked(_level)) return;
 
-    _skillCooldown = skill.cooldown;
+    _skillCooldowns[groupIndex] = group.cooldown;
+    _activeSkillGroup = groupIndex;
+    final tier = group.tierAt(_level);
 
-    switch (_level) {
-      case 1: // Dash
+    HapticFeedback.heavyImpact();
+    _spawnFloatingText(group.tierNames[tier], const Color(0xff00bcd4), 1.5);
+
+    switch (groupIndex) {
+      case 0: // 閃避衝刺 (Lv.1-3)
         _skillEffectTimer = .3;
         _player += _heading * _fishLength(_level) * 3;
-        _showFeedback('⚡ ${skill.name}');
-        break;
-      case 2: // Summon
-        _skillEffectTimer = 8;
-        _summonTimer = 8;
-        _summonedFish.clear();
-        for (var i = 0; i < 5; i++) {
-          final angle = _random.nextDouble() * pi * 2;
-          final dist = 60 + _random.nextDouble() * 40;
-          final pos = _player + Offset(cos(angle), sin(angle)) * dist;
-          _summonedFish.add(FishEntity(
-            position: pos,
-            velocity: _heading * 60,
-            level: max(1, _level - 2),
-            depth: _random.nextDouble(),
-            sizeScale: .85 + _random.nextDouble() * .1,
-            speedScale: .9,
-            predator: false,
-            chaseTimer: 0,
-            restTimer: 99,
-            wanderTimer: 99,
-            behaviorState: FishBehaviorState.wander,
-          ));
+        if (tier >= 1 && _level >= 2) {
+          // Summon small fish
+          _summonTimer = 8;
+          _summonedFish.clear();
+          for (var i = 0; i < 3; i++) {
+            final angle = _random.nextDouble() * pi * 2;
+            final dist = 60 + _random.nextDouble() * 40;
+            final pos = _player + Offset(cos(angle), sin(angle)) * dist;
+            _summonedFish.add(
+              FishEntity(
+                position: pos,
+                velocity: _heading * 60,
+                level: max(1, _level - 2),
+                depth: _random.nextDouble(),
+                sizeScale: .85 + _random.nextDouble() * .1,
+                speedScale: .9,
+                predator: false,
+                chaseTimer: 0,
+                restTimer: 99,
+                wanderTimer: 99,
+                behaviorState: FishBehaviorState.wander,
+              ),
+            );
+          }
         }
-        _showFeedback('🐟 ${skill.name}');
+        if (tier >= 2) {
+          // Inflate
+          _skillEffectTimer = 2;
+          _playerSizeMultiplier = 3.0;
+        }
         break;
-      case 3: // Inflate
-        _skillEffectTimer = 2;
-        _playerSizeMultiplier = 3.0;
-        _showFeedback('💥 ${skill.name}');
-        break;
-      case 4: // Blood rage
+
+      case 1: // 血性狂咬 (Lv.4-6)
         _skillEffectTimer = 3;
         _skillEatCount = 0;
-        _showFeedback('🩸 ${skill.name}');
+        if (tier >= 1) {
+          // Sonic wave
+          _sonicWaveRadius = 40;
+        }
         break;
-      case 5: // Sonic wave
-        _skillEffectTimer = .6;
-        _sonicWaveRadius = 40;
-        _showFeedback('🌊 ${skill.name}');
+
+      case 2: // 渦流吸引 (Lv.7-9)
+        _skillEffectTimer = 3 + tier * 0.5; // 3, 3.5, 4s
+        break;
+
+      case 3: // 深淵怒吼 (Lv.10-12)
+        _skillEffectTimer = 0.3; // brief cast
+        _showFeedback('💥 ${group.tierNames[tier]}');
+        // Apply stun to all fish
+        final allFish = [..._fish, ..._summonedFish];
+        for (final f in allFish) {
+          f.stunnedTimer = 1.5 + tier * 0.5; // 1.5, 2.0, 2.5s
+          if (tier >= 1 && tier < 2) {
+            // Push fish away
+            final away = _normalize(f.position - _player);
+            f.position += away * 200;
+          }
+        }
+        if (tier >= 2) {
+          // Kill fish 2+ levels below directly
+          _fish.removeWhere((f) => f.level <= _level - 2);
+          _summonedFish.removeWhere((f) => f.level <= _level - 2);
+          // Respawn to maintain count
+          while (_fish.length < _effectiveFishCount) {
+            _fish.add(_spawnFish(awayFromPlayer: _player));
+          }
+        }
+        break;
+
+      case 4: // 狂暴獵殺 (Lv.13-18)
+        _skillEffectTimer = tier >= 4 ? 3 : 4;
+        if (tier >= 5) {
+          _berserkSpeedMult = 3.0;
+          _berserkEatMult = 3.0;
+        } else if (tier >= 4) {
+          _berserkSpeedMult = 3.0;
+          _berserkEatMult = 3.0;
+        } else if (tier >= 3) {
+          _berserkSpeedMult = 2.5;
+          _berserkEatMult = 2.5;
+        } else if (tier >= 2) {
+          _berserkSpeedMult = 2.0;
+          _berserkEatMult = 2.0;
+        } else if (tier >= 1) {
+          _berserkSpeedMult = 1.5;
+          _berserkEatMult = 1.5;
+        } else {
+          _berserkSpeedMult = 1.5;
+          _berserkEatMult = 1.5;
+        }
+        // Tier 5: also kill small fish
+        if (tier >= 5) {
+          _fish.removeWhere((f) => f.level <= _level - 2);
+          _summonedFish.removeWhere((f) => f.level <= _level - 2);
+          while (_fish.length < _effectiveFishCount) {
+            _fish.add(_spawnFish(awayFromPlayer: _player));
+          }
+        }
         break;
     }
   }
@@ -1148,22 +1470,24 @@ class _GameScreenState extends State<GameScreen>
   // ─── Obstacles ───
 
   void _updateObstacles(double dt) {
+    // Later levels: obstacles spawn more frequently
+    final obstacleMult = 1.0 - (_level - 1) * .035; // 1.0→0.4 at Lv.18
     _hookTimer -= dt;
     if (_hookTimer <= 0) {
       _spawnHook();
-      _hookTimer = 25 + _random.nextDouble() * 10;
+      _hookTimer = (25 + _random.nextDouble() * 10) * obstacleMult;
     }
 
     _poisonTideTimer -= dt;
     if (_poisonTideTimer <= 0) {
       _spawnPoisonTide();
-      _poisonTideTimer = 18 + _random.nextDouble() * 15;
+      _poisonTideTimer = (18 + _random.nextDouble() * 15) * obstacleMult;
     }
 
     _sharkTimer -= dt;
     if (_sharkTimer <= 0) {
       _spawnAiShark();
-      _sharkTimer = 35 + _random.nextDouble() * 25;
+      _sharkTimer = (35 + _random.nextDouble() * 25) * obstacleMult;
     }
 
     for (var i = _obstacles.length - 1; i >= 0; i--) {
@@ -1177,9 +1501,9 @@ class _GameScreenState extends State<GameScreen>
       } else if (obs.type == ObstacleType.aiShark) {
         final toPlayer = _player - obs.position;
         obs.velocity =
-            _normalize(toPlayer) * _playerSpeedForLevel(_level) * .85;
+            _normalize(toPlayer) * _playerSpeedForLevel(_level) * 1.0;
         obs.position += obs.velocity * dt;
-        if (obs.timer > 45) _obstacles.removeAt(i);
+        if (obs.timer > 15) _obstacles.removeAt(i);
       } else if (obs.type == ObstacleType.poisonTide) {
         if (obs.timer > obs.lifetime) _obstacles.removeAt(i);
       } else if (obs.type == ObstacleType.whirlpool) {
@@ -1201,29 +1525,33 @@ class _GameScreenState extends State<GameScreen>
 
   void _spawnHook() {
     final margin = 100.0;
-    _obstacles.add(Obstacle(
-      type: ObstacleType.hook,
-      position: Offset(
-        margin + _random.nextDouble() * max(1, _world.width - margin * 2),
-        -30,
+    _obstacles.add(
+      Obstacle(
+        type: ObstacleType.hook,
+        position: Offset(
+          margin + _random.nextDouble() * max(1, _world.width - margin * 2),
+          -30,
+        ),
+        lifetime: 5,
+        width: 40,
+        height: 80,
       ),
-      lifetime: 5,
-      width: 40,
-      height: 80,
-    ));
+    );
   }
 
   void _spawnPoisonTide() {
     final margin = 120.0;
-    _obstacles.add(Obstacle(
-      type: ObstacleType.poisonTide,
-      position: Offset(
-        margin + _random.nextDouble() * max(1, _world.width - margin * 2),
-        margin + _random.nextDouble() * max(1, _world.height - margin * 2),
+    _obstacles.add(
+      Obstacle(
+        type: ObstacleType.poisonTide,
+        position: Offset(
+          margin + _random.nextDouble() * max(1, _world.width - margin * 2),
+          margin + _random.nextDouble() * max(1, _world.height - margin * 2),
+        ),
+        lifetime: 15,
+        radius: 70 + _random.nextDouble() * 60,
       ),
-      lifetime: 15,
-      radius: 70 + _random.nextDouble() * 60,
-    ));
+    );
   }
 
   void _spawnAiShark() {
@@ -1238,56 +1566,64 @@ class _GameScreenState extends State<GameScreen>
     } else {
       pos = Offset(_random.nextDouble() * _world.width, _world.height + 60);
     }
-    _obstacles.add(Obstacle(
-      type: ObstacleType.aiShark,
-      position: pos,
-      radius: 70,
-      lifetime: 45,
-    ));
+    _obstacles.add(
+      Obstacle(
+        type: ObstacleType.aiShark,
+        position: pos,
+        radius: 70,
+        lifetime: 15,
+      ),
+    );
   }
 
   void _spawnReefs() {
     final margin = 160.0;
     for (var i = 0; i < 6; i++) {
-      _obstacles.add(Obstacle(
-        type: ObstacleType.reef,
-        position: Offset(
-          margin + _random.nextDouble() * max(1, _world.width - margin * 2),
-          _world.height * (.3 + _random.nextDouble() * .6),
+      _obstacles.add(
+        Obstacle(
+          type: ObstacleType.reef,
+          position: Offset(
+            margin + _random.nextDouble() * max(1, _world.width - margin * 2),
+            _world.height * (.3 + _random.nextDouble() * .6),
+          ),
+          radius: 50 + _random.nextDouble() * 60,
         ),
-        radius: 50 + _random.nextDouble() * 60,
-      ));
+      );
     }
   }
 
   void _spawnWhirlpools() {
     final margin = 200.0;
     for (var i = 0; i < 3; i++) {
-      _obstacles.add(Obstacle(
-        type: ObstacleType.whirlpool,
-        position: Offset(
-          margin + _random.nextDouble() * max(1, _world.width - margin * 2),
-          _world.height * (.25 + _random.nextDouble() * .6),
+      _obstacles.add(
+        Obstacle(
+          type: ObstacleType.whirlpool,
+          position: Offset(
+            margin + _random.nextDouble() * max(1, _world.width - margin * 2),
+            _world.height * (.25 + _random.nextDouble() * .6),
+          ),
+          radius: 90 + _random.nextDouble() * 70,
         ),
-        radius: 90 + _random.nextDouble() * 70,
-      ));
+      );
     }
   }
 
   void _spawnCurrents() {
     final margin = 200.0;
     for (var i = 0; i < 4; i++) {
-      _obstacles.add(Obstacle(
-        type: ObstacleType.current,
-        position: Offset(
-          margin + _random.nextDouble() * max(1, _world.width - margin * 2),
-          _world.height * (.25 + _random.nextDouble() * .6),
+      _obstacles.add(
+        Obstacle(
+          type: ObstacleType.current,
+          position: Offset(
+            margin + _random.nextDouble() * max(1, _world.width - margin * 2),
+            _world.height * (.25 + _random.nextDouble() * .6),
+          ),
+          radius: 60,
+          width: 220 + _random.nextDouble() * 180,
+          height: 40,
+          angle: _random.nextDouble() * pi * 2,
         ),
-        radius: 60,
-        width: 220 + _random.nextDouble() * 180,
-        height: 40,
-        angle: _random.nextDouble() * pi * 2,
-      ));
+      );
     }
   }
 
@@ -1302,6 +1638,8 @@ class _GameScreenState extends State<GameScreen>
       if (obs.type == ObstacleType.hook) {
         if (dist < obs.width * .8 + playerR) {
           _hp = max(0, _hp - 30);
+          _spawnFloatingText('-30', const Color(0xffff5a6e), 1.2);
+          HapticFeedback.mediumImpact();
           _player -= _heading * 35;
           _obstacles.removeAt(i);
           if (_hp <= 0) _gameOver = true;
@@ -1309,6 +1647,8 @@ class _GameScreenState extends State<GameScreen>
       } else if (obs.type == ObstacleType.aiShark) {
         if (dist < obs.radius * .6 + playerR) {
           _hp = max(0, _hp - 50);
+          _spawnFloatingText('-50', const Color(0xffff5a6e), 1.2);
+          HapticFeedback.mediumImpact();
           _player -= _heading * 40;
           if (_hp <= 0) _gameOver = true;
         }
@@ -1401,15 +1741,16 @@ class _GameScreenState extends State<GameScreen>
                               CustomPaint(
                                 painter: FishGamePainter(
                                   fishImage: _fishImage!,
+                                  lv16Image: _lv16Image,
+                                  lv17Image: _lv17Image,
+                                  lv18Image: _lv18Image,
                                   fish: [..._fish, ..._summonedFish],
                                   player: _player,
                                   playerLevel: _level,
                                   playerHeading: _heading,
                                   playerHidden: _isInSeaweed(_player),
                                   playerBite: sin(
-                                    (1 -
-                                            (_biteTimer / .24)
-                                                .clamp(0.0, 1.0)) *
+                                    (1 - (_biteTimer / .24).clamp(0.0, 1.0)) *
                                         pi,
                                   ),
                                   seaweed: _seaweed,
@@ -1422,12 +1763,17 @@ class _GameScreenState extends State<GameScreen>
                                   obstacles: _obstacles,
                                   activeEffects: _activeEffects,
                                   isBoosting: _isBoosting,
+                                  isBerserk:
+                                      _activeSkillGroup == 4 &&
+                                      _skillEffectTimer > 0,
+                                  levelUpFlash: _levelUpFlash,
                                   poisonTrail: _poisonTrail,
                                   playerSizeMultiplier: _playerSizeMultiplier,
                                   sonicWaveRadius: _sonicWaveRadius,
                                   isInvincible: _isInvincible,
                                   skillL3Active:
-                                      _level == 3 && _skillEffectTimer > 0,
+                                      _activeSkillGroup == 0 &&
+                                      _skillEffectTimer > 0,
                                 ),
                               ),
                           ],
@@ -1442,6 +1788,16 @@ class _GameScreenState extends State<GameScreen>
                       camera: _camera,
                       zoom: _cameraZoom,
                       alpha: _tapAlpha,
+                    ),
+                  ),
+                if (_floatingNumbers.isNotEmpty)
+                  Positioned.fill(
+                    child: IgnorePointer(
+                      child: CustomPaint(
+                        painter: _FloatingNumbersPainter(
+                          numbers: _floatingNumbers,
+                        ),
+                      ),
                     ),
                   ),
                 if (_feedbackTimer > 0 && _feedbackText.isNotEmpty)
@@ -1473,6 +1829,7 @@ class _GameScreenState extends State<GameScreen>
                         _Hud(
                           level: _level,
                           hp: _hp,
+                          maxHp: _maxHp,
                           xp: _xp,
                           xpGoal: _xpGoal,
                           boostSize: _playerSizeMultiplier,
@@ -1485,9 +1842,7 @@ class _GameScreenState extends State<GameScreen>
                             const Spacer(),
                             // Active power-up indicators
                             if (_activeEffects.isNotEmpty)
-                              _ActiveEffectsBar(
-                                effects: _activeEffects,
-                              ),
+                              _ActiveEffectsBar(effects: _activeEffects),
                           ],
                         ),
                         const SizedBox(height: 8),
@@ -1495,29 +1850,43 @@ class _GameScreenState extends State<GameScreen>
                           crossAxisAlignment: CrossAxisAlignment.end,
                           children: [
                             const Spacer(),
-                            // Skill button
-                            if (SkillDef.hasSkill(_level))
-                              _SkillButton(
-                                skill: SkillDef.forLevel(_level)!,
-                                cooldown: _skillCooldown,
-                                onTap: _useSkill,
+                            // Skill + Boost buttons (scrollable if overflow)
+                            Flexible(
+                              child: SingleChildScrollView(
+                                scrollDirection: Axis.horizontal,
+                                reverse: true, // right-aligned
+                                child: Row(
+                                  children: [
+                                    for (var i = 0; i < 5; i++)
+                                      if (SkillGroup.byIndex(
+                                        i,
+                                      )!.isUnlocked(_level))
+                                        Padding(
+                                          padding: const EdgeInsets.only(
+                                            right: 8,
+                                          ),
+                                          child: _SkillButton(
+                                            group: SkillGroup.byIndex(i)!,
+                                            cooldown: _skillCooldowns[i],
+                                            active:
+                                                _activeSkillGroup == i &&
+                                                _skillEffectTimer > 0,
+                                            onTap: () => _useSkill(i),
+                                          ),
+                                        ),
+                                    const SizedBox(width: 4),
+                                    _BoostButton(
+                                      isBoosting: _isBoosting,
+                                      cooldown: _boostCooldown,
+                                      cooldownMax: _boostCooldownTime,
+                                      onTap: () => _startBoosting(),
+                                    ),
+                                  ],
+                                ),
                               ),
-                            const SizedBox(width: 12),
-                            // Boost button
-                            _BoostButton(
-                              isBoosting: _isBoosting,
-                              canBoost:
-                                  _playerSizeMultiplier >
-                                  _initialPlayerSize * .15,
-                              sizePercent: _playerSizeMultiplier,
-                              onPressed: _isBoosting
-                                  ? _stopBoosting
-                                  : _startBoosting,
                             ),
                             const SizedBox(width: 8),
-                            Flexible(
-                              child: _ScoreBadge(score: _score),
-                            ),
+                            Flexible(child: _ScoreBadge(score: _score)),
                           ],
                         ),
                       ],
@@ -1735,6 +2104,7 @@ class _Hud extends StatelessWidget {
   const _Hud({
     required this.level,
     required this.hp,
+    required this.maxHp,
     required this.xp,
     required this.xpGoal,
     required this.boostSize,
@@ -1742,6 +2112,7 @@ class _Hud extends StatelessWidget {
 
   final int level;
   final int hp;
+  final int maxHp;
   final int xp;
   final int xpGoal;
   final double boostSize;
@@ -1787,7 +2158,10 @@ class _Hud extends StatelessWidget {
                 ],
                 const SizedBox(width: 12),
                 Expanded(
-                  child: _Bar(value: hp / 100, color: const Color(0xffff3157)),
+                  child: _Bar(
+                    value: hp / maxHp,
+                    color: const Color(0xffff3157),
+                  ),
                 ),
                 const SizedBox(width: 8),
                 Text(
@@ -1835,66 +2209,68 @@ class _Bar extends StatelessWidget {
 class _BoostButton extends StatelessWidget {
   const _BoostButton({
     required this.isBoosting,
-    required this.canBoost,
-    required this.sizePercent,
-    required this.onPressed,
+    required this.cooldown,
+    required this.cooldownMax,
+    required this.onTap,
   });
 
   final bool isBoosting;
-  final bool canBoost;
-  final double sizePercent;
-  final VoidCallback onPressed;
+  final double cooldown;
+  final double cooldownMax;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
-    final active = isBoosting && canBoost;
+    final ready = cooldown <= 0 && !isBoosting;
+    final progress = ready
+        ? 1.0
+        : 1.0 - ((isBoosting ? 0 : cooldown) / cooldownMax).clamp(0.0, 1.0);
     return GestureDetector(
-      onTapDown: (_) => onPressed(),
-      onTapUp: (_) {
-        if (isBoosting) onPressed();
+      behavior: HitTestBehavior.opaque,
+      onTap: () {
+        if (ready) onTap();
       },
-      child: Container(
-        width: 52,
-        height: 52,
-        decoration: BoxDecoration(
-          shape: BoxShape.circle,
-          color: (active
-                  ? const Color(0xff00bcd4)
-                  : const Color(0xff1a3540))
-              .withValues(alpha: .72),
-          border: Border.all(
-            color: active
-                ? const Color(0xff4dd0e1)
-                : Colors.white.withValues(alpha: .2),
-            width: 2,
-          ),
-          boxShadow: active
-              ? [
-                  BoxShadow(
-                    color: const Color(0xff00bcd4).withValues(alpha: .4),
-                    blurRadius: 12,
-                  ),
-                ]
-              : null,
-        ),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
+      child: SizedBox(
+        width: 56,
+        height: 56,
+        child: Stack(
+          alignment: Alignment.center,
           children: [
-            Text(
-              '⚡',
-              style: TextStyle(
-                fontSize: 18,
-                color: canBoost ? Colors.white : Colors.white38,
+            SizedBox(
+              width: 44,
+              height: 44,
+              child: CircularProgressIndicator(
+                value: progress,
+                strokeWidth: 3,
+                backgroundColor: Colors.white.withValues(alpha: .08),
+                valueColor: AlwaysStoppedAnimation<Color>(
+                  isBoosting
+                      ? const Color(0xff00bcd4)
+                      : ready
+                      ? const Color(0xfff0c040)
+                      : Colors.white.withValues(alpha: .25),
+                ),
               ),
             ),
             Text(
-              '${(sizePercent * 100).round()}%',
+              '🚀',
               style: TextStyle(
-                fontSize: 9,
-                color: canBoost ? Colors.white70 : Colors.white24,
-                fontWeight: FontWeight.w600,
+                fontSize: 16,
+                color: ready ? Colors.white : Colors.white38,
               ),
             ),
+            if (!ready && !isBoosting)
+              Positioned(
+                bottom: 4,
+                child: Text(
+                  '${cooldown.ceil()}s',
+                  style: const TextStyle(
+                    color: Colors.white38,
+                    fontSize: 8,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
           ],
         ),
       ),
@@ -1908,13 +2284,15 @@ class _BoostButton extends StatelessWidget {
 
 class _SkillButton extends StatelessWidget {
   const _SkillButton({
-    required this.skill,
+    required this.group,
     required this.cooldown,
+    required this.active,
     required this.onTap,
   });
 
-  final SkillDef skill;
+  final SkillGroup group;
   final double cooldown;
+  final bool active;
   final VoidCallback onTap;
 
   @override
@@ -1922,45 +2300,49 @@ class _SkillButton extends StatelessWidget {
     final ready = cooldown <= 0;
     final progress = ready
         ? 1.0
-        : 1.0 - (cooldown / skill.cooldown).clamp(0.0, 1.0);
+        : 1.0 - (cooldown / group.cooldown).clamp(0.0, 1.0);
     return GestureDetector(
-      onTap: ready ? onTap : null,
+      behavior: HitTestBehavior.opaque,
+      onTap: () {
+        if (ready) onTap();
+      },
       child: SizedBox(
-        width: 52,
-        height: 52,
+        width: 56,
+        height: 56,
         child: Stack(
           alignment: Alignment.center,
           children: [
             SizedBox(
-              width: 48,
-              height: 48,
+              width: 44,
+              height: 44,
               child: CircularProgressIndicator(
                 value: progress,
                 strokeWidth: 3,
                 backgroundColor: Colors.white.withValues(alpha: .08),
                 valueColor: AlwaysStoppedAnimation<Color>(
-                  ready
+                  active
+                      ? const Color(0xff00e676)
+                      : ready
                       ? const Color(0xfff0c040)
                       : Colors.white.withValues(alpha: .25),
                 ),
               ),
             ),
             Text(
-              skill.name.substring(0, 2),
+              group.icon,
               style: TextStyle(
                 color: ready ? Colors.white : Colors.white38,
-                fontSize: 13,
-                fontWeight: FontWeight.w900,
+                fontSize: 16,
               ),
             ),
             if (!ready)
               Positioned(
-                bottom: 6,
+                bottom: 4,
                 child: Text(
                   '${cooldown.ceil()}s',
                   style: const TextStyle(
                     color: Colors.white38,
-                    fontSize: 9,
+                    fontSize: 8,
                     fontWeight: FontWeight.w600,
                   ),
                 ),
@@ -2133,94 +2515,97 @@ class _GameOverOverlay extends StatelessWidget {
     return ColoredBox(
       color: Colors.black.withValues(alpha: .62),
       child: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: DecoratedBox(
-            decoration: BoxDecoration(
-              color: const Color(0xff071923).withValues(alpha: .92),
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: Colors.white.withValues(alpha: .14)),
-            ),
-            child: Padding(
-              padding: const EdgeInsets.all(22),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Text(
-                    'Game Over',
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 30,
-                      fontWeight: FontWeight.w900,
-                    ),
-                  ),
-                  const SizedBox(height: 10),
-                  Text(
-                    recordText,
-                    style: const TextStyle(
-                      color: Color(0xffb8eef7),
-                      fontSize: 16,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                  const SizedBox(height: 18),
-                  Wrap(
-                    spacing: 10,
-                    runSpacing: 10,
-                    alignment: WrapAlignment.center,
-                    children: [
-                      _ResultTile(label: '分數', value: '$score'),
-                      _ResultTile(label: '最高等級', value: 'Lv.$level'),
-                      _ResultTile(label: '存活', value: timeText),
-                      _ResultTile(label: '反殺', value: '$revengeKills'),
-                      _ResultTile(label: '連吃', value: '$bestCombo'),
-                    ],
-                  ),
-                  const SizedBox(height: 14),
-                  DecoratedBox(
-                    decoration: BoxDecoration(
-                      color: Colors.white.withValues(alpha: .05),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 14,
-                        vertical: 10,
+        child: SingleChildScrollView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: const Color(0xff071923).withValues(alpha: .92),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.white.withValues(alpha: .14)),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.all(22),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text(
+                      'Game Over',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 30,
+                        fontWeight: FontWeight.w900,
                       ),
-                      child: Text(
-                        nextLevelText,
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(
-                          color: Color(0xff3ee6d4),
-                          fontWeight: FontWeight.w800,
+                    ),
+                    const SizedBox(height: 10),
+                    Text(
+                      recordText,
+                      style: const TextStyle(
+                        color: Color(0xffb8eef7),
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 18),
+                    Wrap(
+                      spacing: 10,
+                      runSpacing: 10,
+                      alignment: WrapAlignment.center,
+                      children: [
+                        _ResultTile(label: '分數', value: '$score'),
+                        _ResultTile(label: '最高等級', value: 'Lv.$level'),
+                        _ResultTile(label: '存活', value: timeText),
+                        _ResultTile(label: '反殺', value: '$revengeKills'),
+                        _ResultTile(label: '連吃', value: '$bestCombo'),
+                      ],
+                    ),
+                    const SizedBox(height: 14),
+                    DecoratedBox(
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: .05),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 10,
+                        ),
+                        child: Text(
+                          nextLevelText,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            color: Color(0xff3ee6d4),
+                            fontWeight: FontWeight.w800,
+                          ),
                         ),
                       ),
                     ),
-                  ),
-                  const SizedBox(height: 20),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      OutlinedButton(
-                        onPressed: onHome,
-                        style: OutlinedButton.styleFrom(
-                          foregroundColor: const Color(0xff8abfd4),
-                          side: const BorderSide(color: Color(0xff2a5a6e)),
+                    const SizedBox(height: 20),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        OutlinedButton(
+                          onPressed: onHome,
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: const Color(0xff8abfd4),
+                            side: const BorderSide(color: Color(0xff2a5a6e)),
+                          ),
+                          child: const Text('回首頁'),
                         ),
-                        child: const Text('回首頁'),
-                      ),
-                      const SizedBox(width: 16),
-                      FilledButton(
-                        onPressed: onRestart,
-                        style: FilledButton.styleFrom(
-                          backgroundColor: const Color(0xff18c7bb),
-                          foregroundColor: const Color(0xff031417),
+                        const SizedBox(width: 16),
+                        FilledButton(
+                          onPressed: onRestart,
+                          style: FilledButton.styleFrom(
+                            backgroundColor: const Color(0xff18c7bb),
+                            foregroundColor: const Color(0xff031417),
+                          ),
+                          child: const Text('再來一局'),
                         ),
-                        child: const Text('再來一局'),
-                      ),
-                    ],
-                  ),
-                ],
+                      ],
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
@@ -2507,4 +2892,71 @@ class _JoystickPainter extends CustomPainter {
   bool shouldRepaint(covariant _JoystickPainter oldDelegate) {
     return oldDelegate.origin != origin || oldDelegate.current != current;
   }
+}
+
+// ═══════════════════════════════════════════════════
+// Floating damage/heal numbers
+// ═══════════════════════════════════════════════════
+
+class _FloatingNumber {
+  _FloatingNumber({
+    required this.position,
+    required this.text,
+    required this.color,
+    required this.lifetime,
+  }) : maxLifetime = lifetime;
+
+  Offset position;
+  final String text;
+  final Color color;
+  double lifetime;
+  final double maxLifetime;
+  double get alpha => (lifetime / (lifetime + 0.35)).clamp(0.0, 1.0);
+  bool get isDead => lifetime <= 0;
+
+  void update(double dt) {
+    lifetime -= dt;
+    position = Offset(position.dx, position.dy - 44 * dt);
+  }
+}
+
+class _FloatingNumbersPainter extends CustomPainter {
+  _FloatingNumbersPainter({required this.numbers});
+
+  final List<_FloatingNumber> numbers;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    for (final n in numbers) {
+      final textPainter = TextPainter(
+        text: TextSpan(
+          text: n.text,
+          style: TextStyle(
+            color: n.color.withValues(alpha: n.alpha),
+            fontSize: 22,
+            fontWeight: FontWeight.w900,
+            shadows: [
+              Shadow(
+                color: Colors.black.withValues(alpha: 0.7),
+                blurRadius: 4,
+                offset: const Offset(1, 2),
+              ),
+            ],
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+
+      // Slight horizontal wobble
+      final wobble = sin(n.maxLifetime - n.lifetime * 6) * 8;
+      textPainter.paint(
+        canvas,
+        Offset(n.position.dx - textPainter.width / 2 + wobble,
+               n.position.dy - textPainter.height / 2),
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _FloatingNumbersPainter oldDelegate) => true;
 }
