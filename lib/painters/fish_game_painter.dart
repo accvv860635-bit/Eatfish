@@ -33,9 +33,21 @@ class FishGamePainter extends CustomPainter {
     this.sonicWaveRadius = 0,
     this.isInvincible = false,
     this.skillL3Active = false,
+    this.isBerserk = false,
+    this.levelUpFlash = 0,
+    this.lv15Image,
+    this.lv16Image,
+    this.lv17Image,
+    this.lv18Image,
   });
 
   final ui.Image fishImage;
+  final ui.Image? lv15Image;
+  final ui.Image? lv16Image;
+  final ui.Image? lv17Image;
+  final ui.Image? lv18Image;
+  final bool isBerserk;
+  final double levelUpFlash;
   final List<FishEntity> fish;
   final Offset player;
   final int playerLevel;
@@ -258,7 +270,12 @@ class FishGamePainter extends CustomPainter {
     }
 
     if (level >= 15) {
-      _drawMonsterFish(canvas, rect, level, opacity, bite);
+      final specialImage = _specialImageForLevel(level);
+      if (specialImage != null) {
+        _drawSpecialFish(canvas, rect, specialImage, opacity, bite);
+      } else {
+        _drawMonsterFish(canvas, rect, level, opacity, bite);
+      }
     } else {
       canvas.drawImageRect(
         fishImage,
@@ -523,6 +540,40 @@ class FishGamePainter extends CustomPainter {
       Offset(rect.right - rect.width * .22, -rect.height * .17),
       max(2.4, rect.height * .045),
       eyePaint,
+    );
+  }
+
+  ui.Image? _specialImageForLevel(int level) {
+    return switch (level) {
+      15 => lv15Image,
+      16 => lv16Image,
+      17 => lv17Image,
+      18 => lv18Image,
+      _ => null,
+    };
+  }
+
+  void _drawSpecialFish(
+    Canvas canvas,
+    Rect rect,
+    ui.Image image,
+    double opacity,
+    double bite,
+  ) {
+    // Draw the image scaled to fit the body rect with aspect ratio preserved
+    final imageAspect = image.width / image.height;
+    final drawWidth = rect.width * 1.15;
+    final drawHeight = drawWidth / imageAspect;
+    final drawRect = Rect.fromCenter(
+      center: Offset(rect.center.dx, rect.center.dy - drawHeight * 0.02),
+      width: drawWidth,
+      height: drawHeight,
+    );
+    canvas.drawImageRect(
+      image,
+      Rect.fromLTWH(0, 0, image.width.toDouble(), image.height.toDouble()),
+      drawRect,
+      Paint()..color = Colors.white.withValues(alpha: opacity),
     );
   }
 

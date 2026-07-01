@@ -52,6 +52,7 @@ class _GameScreenState extends State<GameScreen>
 
   ui.Image? _fishImage;
   ui.Image? _bgImage;
+  ui.Image? _lv15Image;
   ui.Image? _lv16Image;
   ui.Image? _lv17Image;
   ui.Image? _lv18Image;
@@ -138,14 +139,22 @@ class _GameScreenState extends State<GameScreen>
   double get _cameraZoom {
     // More aggressive zoom-out at high levels.
     final basedOnLevel = (1.0 - (_level - 1) * .055).clamp(.18, 1.0);
+    var zoom = basedOnLevel;
     // In landscape (wide screen), zoom out proportionally
     if (_screen.width > _screen.height) {
-      return (basedOnLevel * _screen.height / _screen.width).clamp(
+      zoom = (basedOnLevel * _screen.height / _screen.width).clamp(
         0.15,
         basedOnLevel,
       );
     }
-    return basedOnLevel;
+    // Don't zoom out beyond the world — visible area must fit within world
+    if (_world != Size.zero) {
+      final minZoomX = _screen.width / _world.width;
+      final minZoomY = _screen.height / _world.height;
+      final minZoom = max(minZoomX, minZoomY);
+      zoom = max(zoom, minZoom);
+    }
+    return zoom;
   }
 
   Size get _visibleWorldSize =>
@@ -227,6 +236,9 @@ class _GameScreenState extends State<GameScreen>
     final bgData = await rootBundle.load(
       (widget.gameMap ?? GameMaps.all.first).assetPath,
     );
+    final lv15Data = await rootBundle.load(
+      'assets/images/lv15_sperm_whale.png',
+    );
     final lv16Data = await rootBundle.load(
       'assets/images/lv16_megamouth_shark.png',
     );
@@ -238,6 +250,9 @@ class _GameScreenState extends State<GameScreen>
       fishData.buffer.asUint8List(),
     );
     final bgCodec = await ui.instantiateImageCodec(bgData.buffer.asUint8List());
+    final lv15Codec = await ui.instantiateImageCodec(
+      lv15Data.buffer.asUint8List(),
+    );
     final lv16Codec = await ui.instantiateImageCodec(
       lv16Data.buffer.asUint8List(),
     );
@@ -249,6 +264,7 @@ class _GameScreenState extends State<GameScreen>
     );
     final fishFrame = await fishCodec.getNextFrame();
     final bgFrame = await bgCodec.getNextFrame();
+    final lv15Frame = await lv15Codec.getNextFrame();
     final lv16Frame = await lv16Codec.getNextFrame();
     final lv17Frame = await lv17Codec.getNextFrame();
     final lv18Frame = await lv18Codec.getNextFrame();
@@ -256,6 +272,7 @@ class _GameScreenState extends State<GameScreen>
       setState(() {
         _fishImage = fishFrame.image;
         _bgImage = bgFrame.image;
+        _lv15Image = lv15Frame.image;
         _lv16Image = lv16Frame.image;
         _lv17Image = lv17Frame.image;
         _lv18Image = lv18Frame.image;
@@ -1741,6 +1758,7 @@ class _GameScreenState extends State<GameScreen>
                               CustomPaint(
                                 painter: FishGamePainter(
                                   fishImage: _fishImage!,
+                                  lv15Image: _lv15Image,
                                   lv16Image: _lv16Image,
                                   lv17Image: _lv17Image,
                                   lv18Image: _lv18Image,
