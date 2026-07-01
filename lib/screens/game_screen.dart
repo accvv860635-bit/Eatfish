@@ -1631,8 +1631,21 @@ class _GameScreenState extends State<GameScreen>
   }
 
   void _spawnCurrents() {
+    // Fewer currents at higher levels — big fish shouldn't be pushed around
+    int count;
+    if (_level <= 5) {
+      count = 4;
+    } else if (_level <= 10) {
+      count = 3;
+    } else if (_level <= 14) {
+      count = 2;
+    } else if (_level <= 16) {
+      count = 1;
+    } else {
+      return; // Lv17+: no currents
+    }
     final margin = 200.0;
-    for (var i = 0; i < 2; i++) {
+    for (var i = 0; i < count; i++) {
       _obstacles.add(
         Obstacle(
           type: ObstacleType.current,
