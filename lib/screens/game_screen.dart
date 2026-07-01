@@ -131,9 +131,16 @@ class _GameScreenState extends State<GameScreen>
   static const double _poisonTrailRadius = 60;
 
   int get _xpGoal => _level >= maxLevel ? 0 : (_level * _level * 3 + 30);
-  // Later levels: fewer total fish but they're more dangerous
-  int get _effectiveFishCount =>
-      (_fishCount * (1.0 - (_level - 1) * .04)).clamp(8, _fishCount).round();
+  // Later levels: fish count drops sharply after Lv12 to increase difficulty
+  int get _effectiveFishCount {
+    if (_level <= 12) {
+      return (_fishCount * (1.0 - (_level - 1) * .04)).round();
+    }
+    // Lv13+ : aggressive reduction
+    final base = 1.0 - 11 * .04; // .56 at Lv12
+    final mult = (base - (_level - 12) * .10).clamp(.08, 1.0);
+    return (_fishCount * mult).round().clamp(6, _fishCount);
+  }
   int get _secondsSurvived => _runTime.floor();
   int get _maxHp => 60 + _level * 15;
   double get _cameraZoom {
@@ -748,6 +755,7 @@ class _GameScreenState extends State<GameScreen>
         }
       }
 
+      final wasStunned = fish.behaviorState == FishBehaviorState.stunned;
       if (fish.stunnedTimer > 0) {
         fish.behaviorState = FishBehaviorState.stunned;
         fish.velocity = Offset.lerp(
@@ -757,6 +765,13 @@ class _GameScreenState extends State<GameScreen>
         )!;
         fish.position += fish.velocity * dt * slowMult;
         continue;
+      }
+
+      // Reset AI timers when coming out of stun so fish doesn't get stuck
+      if (wasStunned) {
+        fish.wanderTimer = 0;
+        fish.chaseTimer = 0;
+        fish.restTimer = 0;
       }
 
       var desired = fish.velocity;
@@ -962,22 +977,17 @@ class _GameScreenState extends State<GameScreen>
         final hpRestore = 5 + spec.damage ~/ 3;
         _hp = min(_maxHp, _hp + hpRestore); // small HP restore
         if (_hp < _maxHp && hpRestore > 0) {
-          _spawnFloatingText('+$hpRestore ❤️', const Color(0xff3ee6d4), 1.0);
+          _spawnFloatingText('+$hpRestore', const Color(0xff3ee6d4), 0.9);
         }
         if (_combo >= 5) {
-          _spawnFloatingText('x$_combo', const Color(0xfff0c040), 1.3);
           HapticFeedback.heavyImpact();
         } else if (_combo >= 3) {
-          _spawnFloatingText('x$_combo', const Color(0xfff0c040), 1.0);
           HapticFeedback.mediumImpact();
         } else {
           HapticFeedback.lightImpact();
         }
         if (revengeBonus) {
           _revengeKills += 1;
-          _spawnFloatingText('反殺!', const Color(0xffff5a6e), 1.4);
-        } else if (starActive) {
-          _spawnFloatingText('⭐ +${spec.score * doubleMult}', const Color(0xffffd740), 1.2);
         }
 
         _biteTimer = .24;
@@ -990,7 +1000,6 @@ class _GameScreenState extends State<GameScreen>
           _xp -= _xpGoal;
           _level += 1;
           _levelUpFlash = .5;
-          _spawnFloatingText('Lv.$_level！', const Color(0xff3ee6d4), 2.0);
           HapticFeedback.heavyImpact();
         }
 
@@ -1000,7 +1009,6 @@ class _GameScreenState extends State<GameScreen>
           final reduction = tier >= 2 ? 0.8 : 0.5;
           _skillCooldowns[1] = max(0, _skillCooldowns[1] - reduction);
           _skillEatCount++;
-          _showFeedback('狂咬 x$_skillEatCount');
         }
       } else if (_spawnGraceTimer <= 0) {
         if (_isInvincible) {
@@ -1097,7 +1105,6 @@ class _GameScreenState extends State<GameScreen>
         _xp -= _xpGoal;
         _level += 1;
         _levelUpFlash = .5;
-        _spawnFloatingText('Lv.$_level！', const Color(0xff3ee6d4), 2.0);
         HapticFeedback.heavyImpact();
       }
     }
@@ -1282,7 +1289,6 @@ class _GameScreenState extends State<GameScreen>
     // Remove existing effect of same type
     _activeEffects.removeWhere((e) => e.type == type);
     _activeEffects.add(ActiveEffect(type: type, remaining: duration));
-    _spawnFloatingText('${puLabel(type)}!', const Color(0xfff0c040), 1.3);
     HapticFeedback.mediumImpact();
   }
 
@@ -1376,7 +1382,6 @@ class _GameScreenState extends State<GameScreen>
     final tier = group.tierAt(_level);
 
     HapticFeedback.heavyImpact();
-    _spawnFloatingText(group.tierNames[tier], const Color(0xff00bcd4), 1.5);
 
     switch (groupIndex) {
       case 0: // 閃避衝刺 (Lv.1-3)
@@ -1611,7 +1616,7 @@ class _GameScreenState extends State<GameScreen>
 
   void _spawnWhirlpools() {
     final margin = 200.0;
-    for (var i = 0; i < 3; i++) {
+    for (var i = 0; i < 1; i++) {
       _obstacles.add(
         Obstacle(
           type: ObstacleType.whirlpool,
@@ -1627,7 +1632,7 @@ class _GameScreenState extends State<GameScreen>
 
   void _spawnCurrents() {
     final margin = 200.0;
-    for (var i = 0; i < 4; i++) {
+    for (var i = 0; i < 2; i++) {
       _obstacles.add(
         Obstacle(
           type: ObstacleType.current,
@@ -1663,11 +1668,12 @@ class _GameScreenState extends State<GameScreen>
         }
       } else if (obs.type == ObstacleType.aiShark) {
         if (dist < obs.radius * .6 + playerR) {
-          _hp = max(0, _hp - 50);
-          _spawnFloatingText('-50', const Color(0xffff5a6e), 1.2);
-          HapticFeedback.mediumImpact();
-          _player -= _heading * 40;
-          if (_hp <= 0) _gameOver = true;
+          final sharkDamage = (_maxHp * 0.75).round(); // reduce to ~1/4 HP
+          _hp = max(1, _hp - sharkDamage);
+          _spawnFloatingText('-$sharkDamage', const Color(0xffff5a6e), 1.0);
+          HapticFeedback.heavyImpact();
+          _player -= _heading * 50;
+          _obstacles.removeAt(i); // shark disappears after hit
         }
       } else if (obs.type == ObstacleType.poisonTide) {
         if (dist < obs.radius + playerR) {
