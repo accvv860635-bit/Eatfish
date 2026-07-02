@@ -465,7 +465,7 @@ class _GameScreenState extends State<GameScreen>
       speedScale: speed / _baseSpeedForLevel(level),
       predator:
           level >= 5 &&
-          level > _level &&
+          level >= _level &&
           _random.nextDouble() < spec.chaseChance,
       chaseTimer: .6 + _random.nextDouble() * 2,
       restTimer: _random.nextDouble() * 3,
@@ -1682,11 +1682,12 @@ class _GameScreenState extends State<GameScreen>
       } else if (obs.type == ObstacleType.aiShark) {
         if (dist < obs.radius * .6 + playerR) {
           final sharkDamage = (_maxHp * 0.75).round(); // reduce to ~1/4 HP
-          _hp = max(1, _hp - sharkDamage);
+          _hp = max(0, _hp - sharkDamage);
           _spawnFloatingText('-$sharkDamage', const Color(0xffff5a6e), 1.0);
           HapticFeedback.heavyImpact();
           _player -= _heading * 50;
           _obstacles.removeAt(i); // shark disappears after hit
+          if (_hp <= 0) _gameOver = true;
         }
       } else if (obs.type == ObstacleType.poisonTide) {
         if (dist < obs.radius + playerR) {
@@ -1959,7 +1960,11 @@ class _GameScreenState extends State<GameScreen>
                         _reset(_screen);
                       });
                     },
-                    onHome: () => Navigator.of(context).pop(),
+                    onHome: () {
+                      _gameOver = true;
+                      _saveGameRecord();
+                      Navigator.of(context).pop();
+                    },
                   ),
               ],
             );

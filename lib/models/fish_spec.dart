@@ -25,7 +25,7 @@ class FishSpec {
 }
 
 class FishSpecs {
-  static const int maxLevel = 18;
+  static const int maxLevel = 12;
 
   static const List<FishSpec> all = [
     FishSpec(
